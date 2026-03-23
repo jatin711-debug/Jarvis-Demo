@@ -8,6 +8,7 @@ Wake word → Record → STT → Agent → TTS → Speaker
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
 
 from jarvis.core.events import EventBus
@@ -279,16 +280,19 @@ class Orchestrator:
             silent_count = 0
             logger.info("🧑 You: %s", text)
 
+            # Strip punctuation for phrase matching
+            text_clean = re.sub(r"[^\w\s']", "", text.lower()).strip()
+
             # Exit commands — shut down the app
-            if text.lower() in ("exit", "quit", "bye", "goodbye", "shut down", "stop",
-                                "that's all", "that is all", "never mind", "go to sleep"):
+            if text_clean in ("exit", "quit", "bye", "goodbye", "shut down", "stop",
+                              "thats all", "that is all", "never mind", "go to sleep"):
                 await self._speak_safe("Goodbye!")
                 self._running = False
                 return
 
             # Dismissal phrases — end the session but keep app running
-            if text.lower() in ("thanks", "thank you", "ok thanks", "that's it",
-                                "nothing else", "i'm good", "all done", "done"):
+            if text_clean in ("thanks", "thank you", "ok thanks", "thats it",
+                              "nothing else", "im good", "all done", "done"):
                 await self._speak_safe("Alright, I'll be here if you need me.")
                 return
 
@@ -303,12 +307,16 @@ class Orchestrator:
             logger.info("🤖 Jarvis: %s", response)
             self.wake_word.suppress()
             try:
+                logger.debug("🔊 Speaking response...")
                 await self.tts.speak(response)
+                logger.debug("🔊 TTS done")
             finally:
                 self.wake_word.unsuppress(cooldown=0.5)
 
             # Soft beep to signal "I'm still listening"
+            logger.debug("🔔 Playing follow-up beep...")
             await self._play_listening_beep()
+            logger.debug("🔔 Beep done, looping back to listen")
 
     async def run(self) -> None:
         """Main voice loop: wake word → conversation session → repeat."""

@@ -33,7 +33,8 @@ llm:
   model: "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
   base_url: "http://localhost:11434"
   max_tokens: 256              # short for voice responses
-  temperature: 0.5
+  temperature: 0.6             # NVIDIA recommended for tool calling
+  top_p: 0.95                  # NVIDIA recommended for tool calling
   context_window: 8192         # Practical context limit
   system_prompt: |
     You are Jarvis, a voice-controlled local AI assistant with FULL admin access

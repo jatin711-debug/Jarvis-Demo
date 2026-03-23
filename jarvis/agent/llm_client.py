@@ -97,6 +97,7 @@ class LLMClient:
             "keep_alive": "30m",
             "options": {
                 "temperature": temperature or self.config.temperature,
+                "top_p": self.config.top_p,
                 "num_predict": max_tokens or self.config.max_tokens,
                 "num_ctx": self.config.context_window,
             },

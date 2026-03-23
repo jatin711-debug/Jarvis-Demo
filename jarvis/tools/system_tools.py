@@ -82,10 +82,46 @@ def register_system_tools(
         },
     )
     async def open_application(app_name: str) -> str:
+        # Common friendly names → actual Windows executables / URIs
+        _WIN_ALIASES: dict[str, str] = {
+            "calculator": "calc",
+            "calc": "calc",
+            "notepad": "notepad",
+            "paint": "mspaint",
+            "snipping tool": "snippingtool",
+            "task manager": "taskmgr",
+            "control panel": "control",
+            "file explorer": "explorer",
+            "explorer": "explorer",
+            "command prompt": "cmd",
+            "cmd": "cmd",
+            "powershell": "powershell",
+            "settings": "ms-settings:",
+            "store": "ms-windows-store:",
+            "mail": "outlookmail:",
+            "calendar": "outlookcal:",
+            "clock": "ms-clock:",
+            "alarms": "ms-clock:",
+            "weather": "bingweather:",
+            "maps": "bingmaps:",
+            "camera": "microsoft.windows.camera:",
+            "photos": "ms-photos:",
+            "xbox": "xbox:",
+            "word": "winword",
+            "excel": "excel",
+            "powerpoint": "powerpnt",
+            "spotify": "spotify",
+            "discord": "discord",
+            "teams": "msteams:",
+            "terminal": "wt",
+            "windows terminal": "wt",
+        }
         try:
+            key = app_name.strip().lower()
             if platform.system() == "Windows":
+                cmd = _WIN_ALIASES.get(key, app_name)
                 subprocess.Popen(
-                    f"start {app_name}",
+                    f'start "" "{cmd}"',
                     shell=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

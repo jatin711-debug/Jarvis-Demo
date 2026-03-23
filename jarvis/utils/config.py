@@ -54,7 +54,8 @@ class LLMConfig(BaseModel):
     model: str = "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
     base_url: str = "http://localhost:11434"
     max_tokens: int = 512
-    temperature: float = 0.7
+    temperature: float = 0.6
+    top_p: float = 0.95
     context_window: int = 8192
     system_prompt: str = (
         "You are Jarvis, a helpful local AI assistant. "
