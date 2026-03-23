@@ -80,7 +80,8 @@ def setup_logging(
     )
 
     # Silence noisy libraries
-    for noisy in ("httpx", "httpcore", "chromadb", "urllib3", "uvicorn.access"):
+    for noisy in ("httpx", "httpcore", "chromadb", "urllib3", "uvicorn.access",
+                   "mem0", "mem0.memory", "mem0.memory.main"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _CONFIGURED = True

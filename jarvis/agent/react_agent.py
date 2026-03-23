@@ -25,43 +25,41 @@ MAX_ITERATIONS = 5
 
 # System prompt addition that teaches the LLM how to use tools
 TOOL_PROMPT_TEMPLATE = """
-You have access to the following tools. To use a tool, respond with EXACTLY this JSON format (and nothing else before it):
+You have tools. To call one, reply with ONLY this JSON (nothing else):
 
 ```json
-{{"tool": "<tool_name>", "args": {{<arguments>}}}}
+{{"tool": "<name>", "args": {{...}}}}
 ```
 
-When you want to give a final answer to the user (no tool needed), just respond normally with text.
+If no tool is needed, reply with plain text.
 
-Available tools:
+Tools:
 {tool_descriptions}
 
-IMPORTANT RULES:
-- Use ONLY ONE tool call per response
-- After receiving a tool result, either use another tool or give your final answer
-- For potentially dangerous operations, explain what you'll do first
-- Always respond in a helpful, concise manner
+RULES:
+- ONE tool call per response, no extra text around the JSON
+- NEVER say you did something without calling a tool first
+- If the user asks you to do something (search, open, click, navigate), you MUST call the appropriate tool
+- After getting a tool result, respond to the user based on that result
+- Be concise — responses will be spoken aloud
 """
 
 
 def _build_tool_descriptions(registry: ToolRegistry) -> str:
-    """Build human-readable tool descriptions for the system prompt."""
+    """Build compact tool descriptions to minimize prompt tokens."""
     lines = []
     for name in registry.list_tools():
         tool = registry.get(name)
         if tool is None:
             continue
         params = tool.parameters.get("properties", {})
-        param_str = ", ".join(
-            f"{k}: {v.get('type', 'any')} - {v.get('description', '')}"
-            for k, v in params.items()
-        )
-        required = tool.parameters.get("required", [])
-        lines.append(
-            f"- **{name}**: {tool.description}\n"
-            f"  Parameters: {param_str or '(none)'}\n"
-            f"  Required: {', '.join(required) if required else '(none)'}"
-        )
+        required = set(tool.parameters.get("required", []))
+        parts = []
+        for k, v in params.items():
+            req = "*" if k in required else ""
+            parts.append(f"{k}{req}:{v.get('type','any')}")
+        param_str = ", ".join(parts) if parts else ""
+        lines.append(f"- {name}({param_str}) — {tool.description}")
     return "\n".join(lines)
 
 
@@ -177,6 +175,7 @@ class ReActAgent:
         messages.append({"role": "user", "content": user_message})
 
         # ReAct loop
+        self._last_tool_call = None  # reset dedup tracker per run
         for iteration in range(MAX_ITERATIONS):
             logger.debug("ReAct iteration %d/%d", iteration + 1, MAX_ITERATIONS)
 
@@ -198,6 +197,20 @@ class ReActAgent:
             # Execute the tool
             tool_name = tool_call.get("tool", "")
             tool_args = tool_call.get("args", {})
+
+            # Prevent duplicate consecutive tool calls (same tool+args)
+            call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
+            if hasattr(self, "_last_tool_call") and self._last_tool_call == call_key:
+                logger.warning("⚠️ Skipping duplicate tool call: %s", tool_name)
+                # Force a final answer by stripping the tool JSON from content
+                final = re.sub(r"```json.*?```", "", content, flags=re.DOTALL).strip()
+                final = re.sub(r'\{\s*"tool"\s*:.*\}', "", final, flags=re.DOTALL).strip()
+                if final:
+                    return final
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"You already called '{tool_name}' with the same arguments. Give your final response to the user now."})
+                continue
+            self._last_tool_call = call_key
 
             logger.info("🔧 Agent calling tool: %s(%s)", tool_name, tool_args)
 

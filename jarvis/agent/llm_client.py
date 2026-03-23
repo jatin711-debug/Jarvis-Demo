@@ -94,6 +94,7 @@ class LLMClient:
             "model": self.config.model,
             "messages": messages,
             "stream": False,
+            "keep_alive": "30m",
             "options": {
                 "temperature": temperature or self.config.temperature,
                 "num_predict": max_tokens or self.config.max_tokens,

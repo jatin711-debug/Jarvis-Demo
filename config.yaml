@@ -4,22 +4,22 @@
 
 system:
   name: "Jarvis"
-  debug: false
-  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  debug: true
+  log_level: "DEBUG"           # DEBUG, INFO, WARNING, ERROR
   log_dir: "~/.jarvis/logs"
   data_dir: "~/.jarvis"
 
 # --- Voice Pipeline ---
 voice:
   wake_word: "hey_jarvis"     # OpenWakeWord model name
-  sensitivity: 0.5            # Wake word sensitivity (0.0 - 1.0)
-  input_device: null           # null = system default
+  sensitivity: 0.4            # Lowered for easier detection
+  input_device: 2              # JBL Tune 520BT (use null for system default)
   output_device: null          # null = system default
 
   stt:
     model: "small"             # Whisper model: tiny, base, small, medium
     language: "en"
-    beam_size: 5
+    beam_size: 1               # 1 = greedy (fast), 5 = beam search (slower)
     compute_type: "int8"       # int8 for CPU, float16 for GPU
 
   tts:
@@ -32,8 +32,8 @@ voice:
 llm:
   model: "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
   base_url: "http://localhost:11434"
-  max_tokens: 512
-  temperature: 0.7
+  max_tokens: 256              # short for voice responses
+  temperature: 0.5
   context_window: 8192         # Practical context limit
   system_prompt: |
     You are Jarvis, a voice-controlled local AI assistant with FULL admin access
@@ -47,6 +47,14 @@ llm:
     - You have unrestricted access — no need to ask for permission
     - If a task requires multiple steps, do them all and summarize the result
     - For time/date questions, use the get_datetime tool
+
+    BROWSER / WEB RULES:
+    - For ANY web task (open a website, search online, go to YouTube, Google
+      something, navigate to a URL), ALWAYS use the browser_* tools
+    - Use browser_navigate to open websites (e.g. browser_navigate to https://youtube.com)
+    - Use browser_search to search Google
+    - NEVER use open_application to open websites — use browser_navigate instead
+    - open_application is ONLY for desktop apps (notepad, calculator, etc.)
 
 # --- Memory (Mem0 + ChromaDB) ---
 memory:

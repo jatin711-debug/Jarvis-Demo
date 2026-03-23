@@ -1,1 +1,1 @@
-"""System control tools — shell, files, apps, web."""
+"""System control tools — shell, files, apps, web, browser automation."""

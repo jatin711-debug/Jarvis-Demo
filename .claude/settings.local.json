@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"d:/Jarvis\" log --oneline -10)",
+      "Bash(git -C \"d:/Jarvis\" diff --stat)"
+    ]
+  }
+}

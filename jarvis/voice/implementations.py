@@ -52,7 +52,37 @@ def _get_mic_native_rate(device_index: int | None = None) -> int:
             info = pa.get_device_info_by_index(device_index)
         else:
             info = pa.get_default_input_device_info()
+        logger.debug("🎤 Using input device [%d] %s", info["index"], info["name"])
         return int(info.get("defaultSampleRate", 44100))
+    finally:
+        pa.terminate()
+
+
+def _validate_mic(device_index: int | None, sample_rate: int, duration: float = 0.5) -> bool:
+    """Quick mic capture test — returns True if audio level is above noise floor."""
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=sample_rate,
+            input=True,
+            frames_per_buffer=1024,
+            input_device_index=device_index,
+        )
+        peak_rms = 0.0
+        for _ in range(int(sample_rate * duration / 1024)):
+            raw = stream.read(1024, exception_on_overflow=False)
+            audio = np.frombuffer(raw, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+            peak_rms = max(peak_rms, rms)
+        stream.stop_stream()
+        stream.close()
+        return peak_rms > 5.0
+    except Exception as e:
+        logger.warning("🎤 Mic validation failed for device %s: %s", device_index, e)
+        return False
     finally:
         pa.terminate()
 
@@ -214,6 +244,8 @@ class OpenWakeWordEngine(WakeWordEngine):
         self._running = False
         self._native_sr: int = 44100
         self._frame_count = 0  # for periodic debug logging
+        self._suppressed = False  # True while TTS is playing
+        self._cooldown_until: float = 0.0  # timestamp until which detections are ignored
 
     async def startup(self) -> None:
         from openwakeword.model import Model
@@ -221,6 +253,30 @@ class OpenWakeWordEngine(WakeWordEngine):
         # Detect mic native sample rate
         self._native_sr = _get_mic_native_rate(self.input_device)
         logger.info("🎤 Mic native sample rate: %d Hz", self._native_sr)
+
+        # Quick mic health check at startup
+        if not _validate_mic(self.input_device, self._native_sr):
+            logger.warning(
+                "⚠️  Mic device %s appears SILENT (Level ≈ 0). "
+                "Check: Windows mic privacy settings, mute switch, "
+                "or set 'input_device' in config.yaml to a working device index.",
+                self.input_device if self.input_device is not None else "(default)",
+            )
+            # List available input devices to help the user
+            import pyaudio
+            pa = pyaudio.PyAudio()
+            try:
+                logger.info("🎤 Available input devices:")
+                for i in range(pa.get_device_count()):
+                    info = pa.get_device_info_by_index(i)
+                    if info["maxInputChannels"] > 0:
+                        logger.info(
+                            "    [%d] %s (ch=%d, rate=%d)",
+                            i, info["name"], info["maxInputChannels"],
+                            int(info["defaultSampleRate"]),
+                        )
+            finally:
+                pa.terminate()
 
         loop = asyncio.get_event_loop()
         self._model = await loop.run_in_executor(
@@ -274,14 +330,29 @@ class OpenWakeWordEngine(WakeWordEngine):
 
         try:
             while self._running:
-                # Read audio at native sample rate
+                # Read audio at native sample rate (always consume to keep buffer clear)
                 raw = await loop.run_in_executor(
                     None, lambda: self._stream.read(native_chunk, exception_on_overflow=False)
                 )
+
+                # While suppressed (TTS playing), just drain the buffer
+                if self._suppressed:
+                    yield False
+                    continue
+
+                # Cooldown after TTS ends — ignore detections for a short period
+                import time as _time
+                if _time.monotonic() < self._cooldown_until:
+                    yield False
+                    continue
+
                 native_audio = np.frombuffer(raw, dtype=np.int16)
 
                 # Resample to 16 kHz
                 audio_16k = _resample(native_audio, self._native_sr, _TARGET_SR)
+
+                # Calculate RMS to prove mic is alive
+                rms = np.sqrt(np.mean(audio_16k.astype(np.float32) ** 2))
 
                 # Run prediction
                 scores = self._model.predict(audio_16k)
@@ -290,7 +361,7 @@ class OpenWakeWordEngine(WakeWordEngine):
                 # Debug: log score every ~5 seconds (62 frames at 80ms each)
                 self._frame_count += 1
                 if self._frame_count % 62 == 0:
-                    logger.debug("Wake word score: %.4f (threshold: %.2f)", score, self.sensitivity)
+                    logger.info("🎙️ Mic Alive | Level: %4.0f | Wake Score: %.4f", rms, score)
 
                 if score >= self.sensitivity:
                     logger.info("🔔 Wake word detected! (score=%.3f)", score)
@@ -301,6 +372,22 @@ class OpenWakeWordEngine(WakeWordEngine):
         finally:
             await self.shutdown()
 
+    def suppress(self) -> None:
+        """Suppress wake word detection (call before TTS starts)."""
+        self._suppressed = True
+        # Reset the model state to prevent TTS audio from building up scores
+        if self._model:
+            self._model.reset()
+
+    def unsuppress(self, cooldown: float = 1.0) -> None:
+        """Resume wake word detection with a cooldown period after TTS."""
+        import time as _time
+        self._suppressed = False
+        self._cooldown_until = _time.monotonic() + cooldown
+        # Reset model again so leftover TTS audio doesn't trigger false positives
+        if self._model:
+            self._model.reset()
+
 
 # ──────────────────────────────────────────────
 # Live Microphone Recording Helper
@@ -309,14 +396,18 @@ class OpenWakeWordEngine(WakeWordEngine):
 
 async def record_until_silence(
     sample_rate: int = 16000,
-    silence_threshold: float = 300.0,
+    silence_threshold: float | None = None,
     silence_duration: float = 1.5,
     max_duration: float = 15.0,
+    min_speech_duration: float = 0.5,
     input_device: int | None = None,
 ) -> bytes:
     """
     Record microphone audio until silence is detected.
     Records at native mic rate, resamples to target, returns WAV bytes.
+
+    If silence_threshold is None, calibrates automatically from the first
+    0.3s of ambient noise (sets threshold to 3x ambient RMS).
     """
     import pyaudio
     import soundfile as sf
@@ -337,10 +428,28 @@ async def record_until_silence(
 
     frames_16k: list[np.ndarray] = []
     silent_chunks = 0
+    speech_detected = False
     max_silent = int(silence_duration * sample_rate / 1024)
     max_chunks = int(max_duration * sample_rate / 1024)
+    min_speech_chunks = int(min_speech_duration * sample_rate / 1024)
 
-    logger.debug("Recording at %d Hz, resampling to %d Hz", native_sr, sample_rate)
+    # --- Auto-calibrate silence threshold from ambient noise ---
+    if silence_threshold is None:
+        calibration_chunks = int(0.3 * sample_rate / 1024)  # 0.3s
+        ambient_levels = []
+        for _ in range(max(calibration_chunks, 3)):
+            raw = await loop.run_in_executor(
+                None, lambda: stream.read(chunk_native, exception_on_overflow=False)
+            )
+            audio = _resample(np.frombuffer(raw, dtype=np.int16), native_sr, sample_rate)
+            ambient_levels.append(float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))))
+        ambient_rms = max(np.mean(ambient_levels), 1.0)
+        silence_threshold = ambient_rms * 3.0
+        # Ensure a reasonable minimum so we don't get stuck on very quiet mics
+        silence_threshold = max(silence_threshold, 30.0)
+        logger.debug("Auto-calibrated silence threshold: %.0f (ambient=%.0f)", silence_threshold, ambient_rms)
+
+    logger.debug("Recording at %d Hz, resampling to %d Hz, silence_thresh=%.0f", native_sr, sample_rate, silence_threshold)
 
     try:
         for _ in range(max_chunks):
@@ -357,8 +466,13 @@ async def record_until_silence(
                 silent_chunks += 1
             else:
                 silent_chunks = 0
+                speech_detected = True
 
-            if silent_chunks >= max_silent and len(frames_16k) > max_silent:
+            # Only stop for silence AFTER we've heard actual speech
+            # and recorded at least min_speech_duration
+            if (speech_detected
+                    and silent_chunks >= max_silent
+                    and len(frames_16k) > min_speech_chunks):
                 break
     finally:
         stream.stop_stream()

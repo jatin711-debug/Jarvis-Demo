@@ -35,5 +35,5 @@ rich>=13.0                      # Pretty terminal output
 pyautogui>=0.9.54               # GUI automation
 psutil>=5.9                     # System info
 
-# --- Web Automation (optional) ---
-# playwright>=1.40              # Uncomment if you need browser automation
+# --- Web Automation ---
+playwright>=1.40                # Browser automation (Chromium/Firefox/WebKit)
