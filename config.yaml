@@ -1,0 +1,76 @@
+# ================================
+# JARVIS Configuration — Voice-Only
+# ================================
+
+system:
+  name: "Jarvis"
+  debug: false
+  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  log_dir: "~/.jarvis/logs"
+  data_dir: "~/.jarvis"
+
+# --- Voice Pipeline ---
+voice:
+  wake_word: "hey_jarvis"     # OpenWakeWord model name
+  sensitivity: 0.5            # Wake word sensitivity (0.0 - 1.0)
+  input_device: null           # null = system default
+  output_device: null          # null = system default
+
+  stt:
+    model: "small"             # Whisper model: tiny, base, small, medium
+    language: "en"
+    beam_size: 5
+    compute_type: "int8"       # int8 for CPU, float16 for GPU
+
+  tts:
+    engine: "kokoro"           # kokoro or piper
+    voice: "af_heart"          # Kokoro voice preset
+    speed: 1.0
+    sample_rate: 24000
+
+# --- LLM (via Ollama) ---
+llm:
+  model: "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
+  base_url: "http://localhost:11434"
+  max_tokens: 512
+  temperature: 0.7
+  context_window: 8192         # Practical context limit
+  system_prompt: |
+    You are Jarvis, a voice-controlled local AI assistant with FULL admin access
+    to the user's Windows system. You can execute any command, manage files,
+    control applications, and perform any system operation.
+
+    IMPORTANT RULES:
+    - Be concise in responses (they will be spoken aloud via TTS)
+    - Keep responses under 2-3 sentences when possible
+    - When executing system commands, briefly confirm what you did
+    - You have unrestricted access — no need to ask for permission
+    - If a task requires multiple steps, do them all and summarize the result
+    - For time/date questions, use the get_datetime tool
+
+# --- Memory (Mem0 + ChromaDB) ---
+memory:
+  enabled: true
+  auto_save: true
+  max_conversation_turns: 15
+  vector_store:
+    provider: "chroma"
+    collection_name: "jarvis_memories"
+    path: "~/.jarvis/vectors"
+
+# --- Security (unrestricted for full admin access) ---
+security:
+  confirm_dangerous_ops: false
+  command_whitelist: false
+  allowed_commands: []
+  blocked_commands: []
+  allowed_directories:
+    - "~"
+    - "C:\\"
+    - "D:\\"
+
+# --- API Server ---
+server:
+  host: "127.0.0.1"
+  port: 8000
+  cors_origins: ["http://localhost:3000"]
