@@ -158,6 +158,82 @@ class KokoroTTS(TTSEngine):
 
 
 # ──────────────────────────────────────────────
+# Piper TTS (ultra-low-latency, ONNX)
+# ──────────────────────────────────────────────
+
+
+class PiperTTS(TTSEngine):
+    """Text-to-Speech using Piper (ONNX, ~150ms synthesis)."""
+
+    # Default voice model path under ~/.jarvis/piper_voices/
+    _DEFAULT_MODEL = "en_US-lessac-medium.onnx"
+
+    def __init__(self, config: VoiceConfig) -> None:
+        self.speed = config.tts.speed
+        model_name = getattr(config.tts, "piper_model", None) or self._DEFAULT_MODEL
+        self._model_path = os.path.join(
+            os.path.expanduser("~"), ".jarvis", "piper_voices", model_name,
+        )
+        self._voice = None
+        self.sample_rate: int = 22050  # updated from model config at startup
+
+    async def startup(self) -> None:
+        from piper import PiperVoice
+
+        loop = asyncio.get_event_loop()
+
+        def _load():
+            return PiperVoice.load(self._model_path)
+
+        self._voice = await loop.run_in_executor(None, _load)
+        self.sample_rate = self._voice.config.sample_rate
+        logger.info(
+            "🔊 Piper TTS ready (model=%s, sr=%d)",
+            os.path.basename(self._model_path), self.sample_rate,
+        )
+
+    async def shutdown(self) -> None:
+        self._voice = None
+
+    async def synthesize(self, text: str) -> bytes:
+        """Synthesize text → WAV bytes."""
+        import soundfile as sf
+
+        loop = asyncio.get_event_loop()
+
+        def _synth():
+            chunks = list(self._voice.synthesize(text))
+            if not chunks:
+                return b""
+            audio = np.concatenate([
+                np.frombuffer(c.audio_int16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                for c in chunks
+            ])
+            buf = io.BytesIO()
+            sf.write(buf, audio, self.sample_rate, format="WAV")
+            return buf.getvalue()
+
+        return await loop.run_in_executor(None, _synth)
+
+    async def speak(self, text: str) -> None:
+        """Synthesize and stream each sentence to speakers immediately."""
+        import sounddevice as sd
+
+        loop = asyncio.get_event_loop()
+
+        def _speak():
+            for chunk in self._voice.synthesize(text):
+                audio = (
+                    np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+                    .astype(np.float32) / 32768.0
+                )
+                sd.play(audio, self.sample_rate)
+                sd.wait()
+
+        await loop.run_in_executor(None, _speak)
+
+
+# ──────────────────────────────────────────────
 # Faster-Whisper STT
 # ──────────────────────────────────────────────
 

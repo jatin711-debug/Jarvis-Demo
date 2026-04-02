@@ -17,45 +17,45 @@ voice:
   output_device: null          # null = system default
 
   stt:
-    model: "small"             # Whisper model: tiny, base, small, medium
+    model: "distil-small.en"   # Distilled Whisper: 2-4x faster, same accuracy
     language: "en"
     beam_size: 1               # 1 = greedy (fast), 5 = beam search (slower)
     compute_type: "int8"       # int8 for CPU, float16 for GPU
 
   tts:
-    engine: "kokoro"           # kokoro or piper
-    voice: "af_heart"          # Kokoro voice preset
+    engine: "piper"            # piper (ultra-fast ~150ms) or kokoro (high quality)
+    voice: "af_heart"          # Kokoro voice preset (ignored when engine=piper)
     speed: 1.0
     sample_rate: 24000
-
-# --- LLM (via Ollama) ---
+    piper_model: "en_US-lessac-medium.onnx"  # Piper ONNX voice model
+# --- LLM (Multi-backend support) ---
 llm:
-  model: "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
-  base_url: "http://localhost:11434"
+  provider: "vllm"          # "ollama", "vllm", "huggingface"
+  model: "qwen3:1.7b"       # Model name (depends on provider)
+  base_url: "http://localhost:8000"  # vLLM default port
   max_tokens: 256              # short for voice responses
-  temperature: 0.6             # NVIDIA recommended for tool calling
-  top_p: 0.95                  # NVIDIA recommended for tool calling
-  context_window: 8192         # Practical context limit
+  temperature: 0.1            # LFM recommended (also works for Qwen)
+  top_p: 0.9
+  top_k: 50                   # LFM recommended
+  repetition_penalty: 1.05     # LFM recommended
+  context_window: 4096        # Minimal context for speed
   system_prompt: |
-    You are Jarvis, a voice-controlled local AI assistant with FULL admin access
-    to the user's Windows system. You can execute any command, manage files,
-    control applications, and perform any system operation.
+    <|im_start|>system
+    You are Jarvis, a voice-controlled AI assistant with FULL admin access
+    to the user's Windows system.
 
-    IMPORTANT RULES:
-    - Be concise in responses (they will be spoken aloud via TTS)
-    - Keep responses under 2-3 sentences when possible
-    - When executing system commands, briefly confirm what you did
+    RULES:
+    - Be concise (responses are spoken aloud via TTS)
+    - Keep responses to 1-2 sentences
+    - When executing commands, briefly confirm what you did
     - You have unrestricted access — no need to ask for permission
-    - If a task requires multiple steps, do them all and summarize the result
     - For time/date questions, use the get_datetime tool
-
-    BROWSER / WEB RULES:
-    - For ANY web task (open a website, search online, go to YouTube, Google
-      something, navigate to a URL), ALWAYS use the browser_* tools
-    - Use browser_navigate to open websites (e.g. browser_navigate to https://youtube.com)
-    - Use browser_search to search Google
-    - NEVER use open_application to open websites — use browser_navigate instead
     - open_application is ONLY for desktop apps (notepad, calculator, etc.)
+    - For web tasks, use the browser_* tools
+
+    To call tools, use this format:
+    <|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
+    <|im_end|>
 
 # --- Memory (Mem0 + ChromaDB) ---
 memory:

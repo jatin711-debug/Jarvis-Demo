@@ -111,18 +111,22 @@ class Orchestrator:
         self.llm = LLMClient(cfg.llm)
         await self.llm.startup()
 
-        # 4. Tools
+        # 4. Tools — system tools always loaded, browser tools on-demand
         self.tools = ToolRegistry()
         register_system_tools(self.tools, cfg.security)
-        register_browser_tools(self.tools)
+
+        self._browser_tools = ToolRegistry()
+        register_browser_tools(self._browser_tools)
 
         # 5. Agent
         self.agent = ReActAgent(
             llm=self.llm,
             tools=self.tools,
             system_prompt=cfg.llm.system_prompt,
+            browser_tools=self._browser_tools,
         )
-        logger.info("🤖 Agent ready with %d tools", len(self.tools))
+        logger.info("🤖 Agent ready with %d tools (+%d browser on-demand)",
+                    len(self.tools), len(self._browser_tools))
 
         # 6. Memory
         self.memory = MemoryManager(cfg.memory, cfg.llm)
@@ -140,9 +144,13 @@ class Orchestrator:
 
     async def _init_voice(self, cfg: JarvisConfig) -> None:
         """Initialize TTS, STT, and WakeWord engines."""
-        from jarvis.voice.implementations import KokoroTTS, WhisperSTT, OpenWakeWordEngine
+        from jarvis.voice.implementations import KokoroTTS, PiperTTS, WhisperSTT, OpenWakeWordEngine
 
-        self.tts = KokoroTTS(cfg.voice)
+        engine = cfg.voice.tts.engine.lower()
+        if engine == "piper":
+            self.tts = PiperTTS(cfg.voice)
+        else:
+            self.tts = KokoroTTS(cfg.voice)
         await self.tts.startup()
 
         self.stt = WhisperSTT(cfg.voice)
@@ -180,6 +188,56 @@ class Orchestrator:
         asyncio.create_task(self.memory.add_conversation(text, response))
 
         return response
+
+    async def _handle_user_message_stream(self, text: str) -> str:
+        """Process user message and speak sentences as they are generated."""
+        assert self.agent is not None
+        assert self.memory is not None
+
+        context = await self.memory.get_context(text)
+
+        full_response = ""
+        sentence_buf = ""
+        _SENTENCE_ENDERS = re.compile(r"[.!?]\s+|[.!?]$|\n")
+
+        self.wake_word.suppress()
+        try:
+            async for token in self.agent.run_stream(
+                user_message=text,
+                conversation_history=self._conversation_history,
+                context=context,
+            ):
+                full_response += token
+                sentence_buf += token
+
+                # Check if we have a complete sentence to speak
+                match = _SENTENCE_ENDERS.search(sentence_buf)
+                if match:
+                    # Speak everything up to and including the sentence ender
+                    end = match.end()
+                    sentence = sentence_buf[:end].strip()
+                    sentence_buf = sentence_buf[end:]
+                    if sentence:
+                        logger.debug("🔊 Streaming sentence: %s", sentence[:80])
+                        await self.tts.speak(sentence)
+
+            # Speak any remaining text
+            leftover = sentence_buf.strip()
+            if leftover:
+                await self.tts.speak(leftover)
+        finally:
+            self.wake_word.unsuppress(cooldown=0.5)
+
+        # Update conversation history
+        self._conversation_history.append({"role": "user", "content": text})
+        self._conversation_history.append({"role": "assistant", "content": full_response})
+
+        max_turns = self.config.memory.max_conversation_turns * 2
+        if len(self._conversation_history) > max_turns:
+            self._conversation_history = self._conversation_history[-max_turns:]
+
+        asyncio.create_task(self.memory.add_conversation(text, full_response))
+        return full_response
 
     async def _speak_safe(self, text: str) -> None:
         """Speak with wake word suppression to prevent echo triggers."""
@@ -296,22 +354,20 @@ class Orchestrator:
                 await self._speak_safe("Alright, I'll be here if you need me.")
                 return
 
-            # Process through agent
+            # Process through agent (streaming: speaks sentences as they generate)
             try:
-                response = await self._handle_user_message(text)
+                response = await self._handle_user_message_stream(text)
             except Exception as e:
                 logger.error("Agent error: %s", e)
                 response = "Sorry, something went wrong while processing your request."
+                self.wake_word.suppress()
+                try:
+                    await self.tts.speak(response)
+                finally:
+                    self.wake_word.unsuppress(cooldown=0.5)
 
-            # Speak response, then immediately ready for follow-up
+            # Log final response
             logger.info("🤖 Jarvis: %s", response)
-            self.wake_word.suppress()
-            try:
-                logger.debug("🔊 Speaking response...")
-                await self.tts.speak(response)
-                logger.debug("🔊 TTS done")
-            finally:
-                self.wake_word.unsuppress(cooldown=0.5)
 
             # Soft beep to signal "I'm still listening"
             logger.debug("🔔 Playing follow-up beep...")

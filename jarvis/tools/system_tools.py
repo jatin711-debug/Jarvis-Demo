@@ -65,6 +65,41 @@ def register_system_tools(
         except Exception as e:
             return f"❌ Error: {e}"
 
+    # ── App name aliases (shared by open_application and type_text) ──
+    _WIN_ALIASES: dict[str, str] = {
+        "calculator": "calc",
+        "calc": "calc",
+        "notepad": "notepad",
+        "paint": "mspaint",
+        "snipping tool": "snippingtool",
+        "task manager": "taskmgr",
+        "control panel": "control",
+        "file explorer": "explorer",
+        "explorer": "explorer",
+        "command prompt": "cmd",
+        "cmd": "cmd",
+        "powershell": "powershell",
+        "settings": "ms-settings:",
+        "store": "ms-windows-store:",
+        "mail": "outlookmail:",
+        "calendar": "outlookcal:",
+        "clock": "ms-clock:",
+        "alarms": "ms-clock:",
+        "weather": "bingweather:",
+        "maps": "bingmaps:",
+        "camera": "microsoft.windows.camera:",
+        "photos": "ms-photos:",
+        "xbox": "xbox:",
+        "word": "winword",
+        "excel": "excel",
+        "powerpoint": "powerpnt",
+        "spotify": "spotify",
+        "discord": "discord",
+        "teams": "msteams:",
+        "terminal": "wt",
+        "windows terminal": "wt",
+    }
+
     # ── Open Application ──
 
     @registry.tool(
@@ -82,40 +117,6 @@ def register_system_tools(
         },
     )
     async def open_application(app_name: str) -> str:
-        # Common friendly names → actual Windows executables / URIs
-        _WIN_ALIASES: dict[str, str] = {
-            "calculator": "calc",
-            "calc": "calc",
-            "notepad": "notepad",
-            "paint": "mspaint",
-            "snipping tool": "snippingtool",
-            "task manager": "taskmgr",
-            "control panel": "control",
-            "file explorer": "explorer",
-            "explorer": "explorer",
-            "command prompt": "cmd",
-            "cmd": "cmd",
-            "powershell": "powershell",
-            "settings": "ms-settings:",
-            "store": "ms-windows-store:",
-            "mail": "outlookmail:",
-            "calendar": "outlookcal:",
-            "clock": "ms-clock:",
-            "alarms": "ms-clock:",
-            "weather": "bingweather:",
-            "maps": "bingmaps:",
-            "camera": "microsoft.windows.camera:",
-            "photos": "ms-photos:",
-            "xbox": "xbox:",
-            "word": "winword",
-            "excel": "excel",
-            "powerpoint": "powerpnt",
-            "spotify": "spotify",
-            "discord": "discord",
-            "teams": "msteams:",
-            "terminal": "wt",
-            "windows terminal": "wt",
-        }
         try:
             key = app_name.strip().lower()
             if platform.system() == "Windows":
@@ -639,9 +640,116 @@ def register_system_tools(
 
     # ── Keyboard / Window Control ──
 
+    # App names → window title substrings for matching
+    _WINDOW_TITLES: dict[str, str] = {
+        "calculator": "Calculator", "calc": "Calculator",
+        "notepad": "Notepad", "paint": "Paint",
+        "word": "Word", "excel": "Excel", "powerpoint": "PowerPoint",
+        "chrome": "Chrome", "firefox": "Firefox", "edge": "Edge",
+        "file explorer": "File Explorer", "explorer": "File Explorer",
+        "spotify": "Spotify", "discord": "Discord",
+        "terminal": "Terminal", "command prompt": "Command Prompt",
+        "powershell": "PowerShell", "visual studio code": "Visual Studio Code",
+        "vscode": "Visual Studio Code",
+    }
+
+    @registry.tool(
+        name="type_text",
+        description="Type text into an app. Set 'app' to auto-open and focus it first (e.g. app='calculator'). Use for typing numbers in Calculator, text in Notepad, etc.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to type (e.g., '5+2', 'Hello World').",
+                },
+                "app": {
+                    "type": "string",
+                    "description": "App to type into (e.g., 'calculator', 'notepad'). Opens it if not already running.",
+                },
+            },
+            "required": ["text"],
+        },
+    )
+    async def type_text(text: str, app: str = "") -> str:
+        try:
+            import pyautogui
+            import time
+
+            # If app specified, ensure it's open and focused
+            if app:
+                app_key = app.strip().lower()
+                win_title = _WINDOW_TITLES.get(app_key, app)
+                windows = pyautogui.getWindowsWithTitle(win_title)
+                if not windows:
+                    # App not open — launch it
+                    cmd = _WIN_ALIASES.get(app_key, app)
+                    subprocess.Popen(
+                        f'start "" "{cmd}"', shell=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    # Wait for window to appear (up to 5s)
+                    for _ in range(25):
+                        time.sleep(0.2)
+                        windows = pyautogui.getWindowsWithTitle(win_title)
+                        if windows:
+                            break
+                if windows:
+                    try:
+                        windows[0].activate()
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                else:
+                    return f"❌ Could not open or find {app} window"
+
+            # Type each character via press() — works with UWP apps like Calculator
+            for ch in text:
+                pyautogui.press(ch)
+                time.sleep(0.05)
+
+            target = f" in {app}" if app else ""
+            return f"✅ Typed '{text}'{target}"
+        except ImportError:
+            return "❌ pyautogui not installed. Run: pip install pyautogui"
+        except Exception as e:
+            return f"❌ Error typing text: {e}"
+
+    @registry.tool(
+        name="focus_window",
+        description="Bring a window to the foreground by title. Use before sending keystrokes.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Window title to search for (partial match, e.g., 'Calculator', 'Notepad').",
+                },
+            },
+            "required": ["title"],
+        },
+    )
+    async def focus_window(title: str) -> str:
+        if platform.system() != "Windows":
+            return "❌ Only supported on Windows"
+        try:
+            import pyautogui
+            import time
+            windows = pyautogui.getWindowsWithTitle(title)
+            if not windows:
+                return f"❌ No window found with title containing '{title}'"
+            win = windows[0]
+            win.activate()
+            time.sleep(0.3)
+            return f"✅ Focused window: {win.title}"
+        except ImportError:
+            return "❌ pyautogui not installed"
+        except Exception as e:
+            return f"❌ Error: {e}"
+
     @registry.tool(
         name="send_keystrokes",
-        description="Send keyboard keystrokes or hotkeys (e.g., 'ctrl+c', 'alt+tab', 'enter').",
+        description="Send special keys or hotkey combos. Use for shortcuts like 'ctrl+c', 'alt+tab', 'enter', 'backspace', 'escape', 'tab'. NOT for typing text — use type_text for that.",
         parameters={
             "type": "object",
             "properties": {
@@ -722,5 +830,191 @@ def register_system_tools(
         import datetime
         now = datetime.datetime.now()
         return now.strftime("Date: %A, %B %d, %Y\nTime: %I:%M %p")
+
+    # ── HTTP Requests (NullClaw-inspired) ──
+
+    @registry.tool(
+        name="http_request",
+        description="Make HTTP requests (GET, POST, PUT, DELETE). Supports headers, JSON body, and returns status + response.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to request."},
+                "method": {
+                    "type": "string",
+                    "description": "HTTP method: GET, POST, PUT, DELETE (default: GET)",
+                },
+                "headers": {
+                    "type": "string",
+                    "description": "Optional JSON headers (e.g., {'Authorization': 'Bearer ...'})",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional JSON body for POST/PUT",
+                },
+            },
+            "required": ["url"],
+        },
+    )
+    async def http_request(url: str, method: str = "GET", headers: str = "", body: str = "") -> str:
+        try:
+            import httpx
+            import json as _json
+            hdrs = _json.loads(headers) if headers else {}
+            bdy = _json.loads(body) if body else None
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.request(
+                    method.upper(), url, headers=hdrs, json=bdy, timeout=30.0
+                )
+                return (
+                    f"Status: {resp.status_code}\n"
+                    f"Headers: {dict(resp.headers)}\n"
+                    f"Body: {resp.text[:2000]}"
+                )
+        except Exception as e:
+            return f"❌ HTTP error: {e}"
+
+    # ── Scheduling (NullClaw-inspired) ──
+
+    @registry.tool(
+        name="scheduler_create",
+        description="Schedule a task to run later (Windows Task Scheduler). Requires app to be running.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Name for the scheduled task."},
+                "command": {"type": "string", "description": "Command to run."},
+                "delay_seconds": {
+                    "type": "integer",
+                    "description": "Delay in seconds before running (default: 60)",
+                },
+            },
+            "required": ["task_name", "command"],
+        },
+    )
+    async def scheduler_create(task_name: str, command: str, delay_seconds: int = 60) -> str:
+        import subprocess
+        try:
+            # Use Windows schtasks
+            task_cmd = f'schtasks /create /tn "Jarvis_{task_name}" /tr "{command}" /sc once /st +00:{delay_seconds}'
+            result = subprocess.run(
+                task_cmd, shell=True, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return f"✅ Scheduled '{task_name}' to run in {delay_seconds}s"
+            return f"❌ Failed: {result.stderr}"
+        except Exception as e:
+            return f"❌ Scheduler error: {e}"
+
+    @registry.tool(
+        name="scheduler_list",
+        description="List scheduled Jarvis tasks.",
+        parameters={"type": "object", "properties": {}},
+    )
+    async def scheduler_list() -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                'schtasks /query /fo csv /v | findstr "Jarvis_"',
+                shell=True, capture_output=True, text=True
+            )
+            return result.stdout or "No Jarvis tasks scheduled."
+        except Exception as e:
+            return f"❌ List error: {e}"
+
+    @registry.tool(
+        name="scheduler_delete",
+        description="Delete a scheduled Jarvis task.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Task name to delete."},
+            },
+            "required": ["task_name"],
+        },
+    )
+    async def scheduler_delete(task_name: str) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                f'schtasks /delete /tn "Jarvis_{task_name}" /f',
+                shell=True, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return f"✅ Deleted task: {task_name}"
+            return f"❌ Failed: {result.stderr}"
+        except Exception as e:
+            return f"❌ Delete error: {e}"
+
+    # ── Web Search (NullClaw-inspired) ──
+
+    @registry.tool(
+        name="web_search",
+        description="Search the web for information. Returns top results with snippets.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."},
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results (default: 5)",
+                },
+            },
+            "required": ["query"],
+        },
+    )
+    async def web_search(query: str, num_results: int = 5) -> str:
+        try:
+            import httpx
+            # Use DuckDuckGo HTML search (no API key needed)
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://html.duckduckgo.com/html/",
+                    params={"q": query, "b": num_results},
+                    timeout=15.0,
+                )
+                # Simple regex parsing for results
+                import re
+                results = []
+                for match in re.finditer(
+                    r'<a class="result__a" href="([^"]+)"[^>]*>([^<]+)</a>.*?'
+                    r'<a class="result__snippet"[^>]*>([^<]+)</a>',
+                    resp.text, re.DOTALL
+                ):
+                    url, title, snippet = match.groups()
+                    if len(results) >= num_results:
+                        break
+                    results.append(
+                        f"• {title.strip()}\n  {snippet.strip()[:200]}\n  {url}"
+                    )
+                if results:
+                    return f"🔍 Results for '{query}':\n\n" + "\n\n".join(results)
+                return f"No results found for '{query}'"
+        except Exception as e:
+            return f"❌ Search error: {e}"
+
+    # ── System Uptime ──
+
+    @registry.tool(
+        name="get_uptime",
+        description="Get system uptime and load averages.",
+        parameters={"type": "object", "properties": {}},
+    )
+    async def get_uptime() -> str:
+        import platform
+        import subprocess
+        try:
+            if platform.system() == "Windows":
+                result = subprocess.run(
+                    "systeminfo | findstr /C:\"System Boot Time\"",
+                    shell=True, capture_output=True, text=True
+                )
+                return result.stdout.strip() or "Uptime info unavailable"
+            else:
+                import uptime
+                return f"Uptime: {uptime.format_timespan(uptime.uptime())}"
+        except Exception as e:
+            return f"❌ Error: {e}"
 
     logger.info("✅ Registered %d system tools", len(registry))

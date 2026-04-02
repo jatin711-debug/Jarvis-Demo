@@ -39,6 +39,7 @@ class TTSConfig(BaseModel):
     voice: str = "af_heart"
     speed: float = 1.0
     sample_rate: int = 24000
+    piper_model: str = "en_US-lessac-medium.onnx"
 
 
 class VoiceConfig(BaseModel):
@@ -51,11 +52,14 @@ class VoiceConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    model: str = "hf.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
+    provider: str = "ollama"      # "ollama" or "huggingface"
+    model: str = "qwen3:1.7b"
     base_url: str = "http://localhost:11434"
     max_tokens: int = 512
     temperature: float = 0.6
     top_p: float = 0.95
+    top_k: int = 50               # For LFM (HuggingFace)
+    repetition_penalty: float = 1.05  # For LFM (HuggingFace)
     context_window: int = 8192
     system_prompt: str = (
         "You are Jarvis, a helpful local AI assistant. "
