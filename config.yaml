@@ -31,7 +31,7 @@ voice:
 # --- LLM (Multi-backend support) ---
 llm:
   provider: "ollama"        # "ollama" or "huggingface"
-  model: "qwen2.5:3b"      # Model name (depends on provider)
+  model: "qwen3.5:4b"      # Model name (depends on provider)
   base_url: "http://localhost:11434"  # Ollama default port
   max_tokens: 512              # short voice responses
   temperature: 0.1            # LFM recommended (also works for Qwen)
@@ -40,7 +40,6 @@ llm:
   repetition_penalty: 1.05     # LFM recommended
   context_window: 4096        # Minimal context for speed
   system_prompt: |
-    <|im_start|>system
     You are Jarvis, a voice-controlled AI assistant with FULL admin access
     to the user's Windows system.
 
@@ -53,10 +52,6 @@ llm:
     - open_application is ONLY for desktop apps (notepad, calculator, etc.)
     - For web tasks, use the browser_* tools
     - Do not think step-by-step. Respond immediately without reasoning.
-
-    To call tools, use this format:
-    <|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
-    <|im_end|>
 
 # --- Memory (Mem0 + ChromaDB) ---
 memory:

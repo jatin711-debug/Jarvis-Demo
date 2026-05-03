@@ -35,27 +35,52 @@ _HALLUCINATION_PHRASES = {
     "thank you so much", "thanks for listening",
 }
 
+# Repeated words / stuttering patterns that indicate noise/gibberish
+_GIBBERISH_RE = re.compile(r"(\b\w+\b)(\W+\1\b){2,}")  # same word 3+ times
+
 
 def _is_hallucination(text: str, audio_bytes: bytes) -> bool:
     """Detect likely Whisper hallucinations on very short / quiet audio."""
     import numpy as np
     import io, soundfile as sf
 
-    # Check if the text matches known hallucination patterns
     cleaned = text.strip().lower().rstrip(".!?,")
-    if cleaned not in _HALLUCINATION_PHRASES:
-        return False
+    if cleaned in _HALLUCINATION_PHRASES:
+        # Verify audio is actually very quiet (confirms hallucination)
+        try:
+            audio_data, sr = sf.read(io.BytesIO(audio_bytes), dtype="int16")
+            rms = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
+            if rms < 100:
+                logger.debug("Whisper hallucination filtered: '%s' (rms=%.0f)", text, rms)
+                return True
+        except Exception:
+            pass
+    return False
 
-    # Verify audio is actually very quiet (confirms hallucination)
-    try:
-        audio_data, sr = sf.read(io.BytesIO(audio_bytes), dtype="int16")
-        rms = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
-        # If audio is quiet (<100 RMS) and text is a known hallucination → skip
-        if rms < 100:
-            logger.debug("Whisper hallucination filtered: '%s' (rms=%.0f)", text, rms)
+
+def _is_garbage(text: str) -> bool:
+    """Detect nonsensical / stuttered transcripts from ambient noise."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    # Very short (< 3 words) and not a known command or dismissal
+    words = stripped.split()
+    if len(words) < 3:
+        low = stripped.lower().rstrip(".!?,")
+        known_short = {
+            "yes", "no", "ok", "okay", "stop", "exit", "quit", "bye",
+            "thanks", "thank you", "done", "goodbye", "jarvis",
+        }
+        if low not in known_short:
+            logger.debug("Garbage filtered (too short): '%s'", text)
             return True
-    except Exception:
-        pass
+
+    # Heavy repetition / stuttering (e.g. "oh. oh. oh.")
+    if _GIBBERISH_RE.search(stripped):
+        logger.debug("Garbage filtered (repetition): '%s'", text)
+        return True
+
     return False
 
 logger = get_logger(__name__)
@@ -302,8 +327,8 @@ class Orchestrator:
         text = await self.stt.transcribe(audio_bytes)
         text = text.strip()
 
-        if not text or _is_hallucination(text, audio_bytes):
-            logger.info("(empty or hallucinated transcription, ignoring)")
+        if not text or _is_hallucination(text, audio_bytes) or _is_garbage(text):
+            logger.info("(empty, hallucinated, or garbage transcription, ignoring)")
             return None
 
         return text

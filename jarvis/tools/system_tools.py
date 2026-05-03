@@ -204,16 +204,16 @@ def register_system_tools(
         parameters={
             "type": "object",
             "properties": {
-                "directory_path": {
+                "path": {
                     "type": "string",
                     "description": "Path to the directory.",
                 },
             },
-            "required": ["directory_path"],
+            "required": ["path"],
         },
     )
-    async def list_directory(directory_path: str) -> str:
-        path = Path(directory_path).expanduser().resolve()
+    async def list_directory(path: str) -> str:
+        path = Path(path).expanduser().resolve()
         if not path.exists():
             return f"❌ Directory not found: {path}"
         if not path.is_dir():

@@ -7,6 +7,8 @@ Uses structured JSON output parsing instead of native tool calling API.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 from typing import Any, AsyncIterator, TYPE_CHECKING
@@ -23,18 +25,20 @@ logger = get_logger(__name__)
 # Maximum tool-calling iterations to prevent infinite loops
 MAX_ITERATIONS = 5
 
+# Keywords that trigger vision (screenshot analysis)
+_VISION_KEYWORDS = re.compile(
+    r"\b(screen|screenshot|what do you see|what's on my screen|"
+    r"this window|this dialog|this error|this message|"
+    r"look at|can you see|show me|"
+    r"click the|where is|find the|locate the|"
+    r"button|icon|menu bar|taskbar|desktop)\b",
+    re.IGNORECASE,
+)
+
 # System prompt addition that teaches the LLM how to use tools
-# Supports both JSON format (Ollama) and LFM format (HuggingFace)
 TOOL_PROMPT_TEMPLATE = """
-You have tools. To call one, use EITHER format:
-
-# LFM/HuggingFace format (preferred):
-<|tool_call_start|>[tool_name(arg="value", arg2=123)]<|tool_call_end|>
-
-# JSON format:
-```json
-{{"tool": "<name>", "args": {{...}}}}
-```
+You have tools. To call one, use ONLY this format:
+<|tool_call_start|>[open_app(app_name="notepad")]<|tool_call_end|>
 
 If no tool is needed, reply with plain text.
 
@@ -42,7 +46,7 @@ Tools:
 {tool_descriptions}
 
 RULES:
-- ONE tool call per response, no extra text around the JSON
+- ONE tool call per response
 - NEVER say you did something without calling a tool first
 - If the user asks you to do something (search, open, click, navigate), you MUST call the appropriate tool
 - After getting a tool result, respond to the user based on that result
@@ -54,7 +58,7 @@ _ACTION_CLAIM_PATTERNS = re.compile(
     r"\b(has opened|has been opened|i opened|i searched|i navigated|i launched|i started|"
     r"i(?:'ve| have) opened|i(?:'ve| have) searched|i(?:'ve| have) navigated|"
     r"i(?:'ve| have) launched|i(?:'ve| have) started|"
-    r"has launched|is now open|opened for you|searched for|navigated to|"
+    r"has launched|opened for you|searched for|navigated to|"
     r"calling the .+ tool|has been saved|i(?:'ve| have) saved|i(?:'ve| have) typed|"
     r"calculator has|browser has|chrome has|youtube has|google has)\b",
     re.IGNORECASE,
@@ -275,6 +279,24 @@ class ReActAgent:
 
         return prompt
 
+    async def _capture_screenshot(self) -> list[str] | None:
+        """Capture the screen and return as base64-encoded PNG."""
+        try:
+            import pyautogui
+            img = pyautogui.screenshot()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            logger.debug("Screenshot captured: %d bytes base64", len(b64))
+            return [b64]
+        except Exception as e:
+            logger.warning("Screenshot capture failed: %s", e)
+            return None
+
+    def _needs_vision(self, text: str) -> bool:
+        """Check if the user message implies visual context is needed."""
+        return bool(_VISION_KEYWORDS.search(text))
+
     async def run(
         self,
         user_message: str,
@@ -298,10 +320,24 @@ class ReActAgent:
         # Detect if browser tools are needed
         include_browser = self._needs_browser_tools(user_message)
         if include_browser:
-            logger.debug("🌐 Browser tools activated for this request")
+            logger.debug("Browser tools activated for this request")
+
+        # Detect if vision is needed
+        images: list[str] | None = None
+        if self._needs_vision(user_message):
+            logger.info("Vision triggered for: %s", user_message[:80])
+            images = await self._capture_screenshot()
+            if images:
+                logger.info("Screenshot attached to LLM request")
 
         # System prompt with tools + context
         system_prompt = self._build_system_prompt(context, include_browser=include_browser)
+        if images:
+            system_prompt += (
+                "\n\nVISION MODE: A screenshot is attached to the user's message. "
+                "Describe or analyze what you see in the image directly. "
+                "Do NOT call tools to capture or analyze the image — it is already provided."
+            )
         messages.append({"role": "system", "content": system_prompt})
 
         # Conversation history
@@ -309,7 +345,14 @@ class ReActAgent:
             messages.extend(conversation_history)
 
         # Current user message
-        messages.append({"role": "user", "content": user_message})
+        if images:
+            # Tell the model to analyze the attached image directly
+            messages.append({
+                "role": "user",
+                "content": f"{user_message}\n\n[I've attached a screenshot. Answer based on what you see in the image.]",
+            })
+        else:
+            messages.append({"role": "user", "content": user_message})
 
         # ReAct loop
         self._last_tool_call = None  # reset dedup tracker per run
@@ -318,7 +361,7 @@ class ReActAgent:
         for iteration in range(MAX_ITERATIONS):
             logger.debug("ReAct iteration %d/%d", iteration + 1, MAX_ITERATIONS)
 
-            response = await self.llm.chat(messages=messages)
+            response = await self.llm.chat(messages=messages, images=images if iteration == 0 else None)
             content = response.get("message", {}).get("content", "")
             thinking = response.get("message", {}).get("thinking", "")
             logger.info("🧠 LLM raw (iter %d): %s", iteration + 1, content[:300])

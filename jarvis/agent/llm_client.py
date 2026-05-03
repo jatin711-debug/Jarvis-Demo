@@ -137,6 +137,7 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Send a chat completion request.
@@ -146,6 +147,7 @@ class LLMClient:
             tools: Optional tool definitions
             temperature: Override config temperature
             max_tokens: Override config max_tokens
+            images: Optional list of base64-encoded images to attach to the last user message
 
         Returns:
             Response dict with 'message' key containing content
@@ -155,7 +157,7 @@ class LLMClient:
                 messages, temperature, max_tokens
             )
         return await self._chat_ollama(
-            messages, tools, temperature, max_tokens
+            messages, tools, temperature, max_tokens, images
         )
 
     async def _chat_ollama(
@@ -164,13 +166,23 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         """Chat via Ollama API."""
         assert self._client is not None, "Call startup() first"
 
+        # Attach images to the last user message if provided
+        msgs = [dict(m) for m in messages]
+        if images and msgs:
+            # Find last user message and attach images
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "user":
+                    msgs[i]["images"] = images
+                    break
+
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": messages,
+            "messages": msgs,
             "stream": False,
             "keep_alive": "30m",
             "options": {
@@ -181,10 +193,14 @@ class LLMClient:
             },
         }
 
+        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
+        if "qwen3.5" in self.config.model.lower():
+            payload["think"] = False
+
         if tools:
             payload["tools"] = tools
 
-        logger.debug("LLM request: %d messages", len(messages))
+        logger.debug("LLM request: %d messages, %d images", len(msgs), len(images or []))
 
         resp = await self._client.post(_API_CHAT, json=payload)
         resp.raise_for_status()
@@ -276,6 +292,10 @@ class LLMClient:
                 "num_ctx": self.config.context_window,
             },
         }
+
+        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
+        if "qwen3.5" in self.config.model.lower():
+            payload["think"] = False
 
         async with self._client.stream("POST", _API_CHAT, json=payload) as resp:
             resp.raise_for_status()
