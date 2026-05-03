@@ -6,6 +6,7 @@ Mem0.ai wrapper for multi-level memory with local Ollama.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
@@ -96,6 +97,7 @@ class MemoryManager:
     ) -> None:
         """
         Process a conversation exchange — Mem0 auto-extracts memories.
+        Runs in a thread pool to avoid blocking the asyncio event loop.
         """
         if not self._config.enabled or not self._memory:
             return
@@ -106,7 +108,7 @@ class MemoryManager:
             {"role": "assistant", "content": assistant_response},
         ]
 
-        try:
+        def _add():
             self._memory.add(
                 conversation,
                 user_id=uid,
@@ -115,6 +117,10 @@ class MemoryManager:
                     "session_id": self._session_id,
                 },
             )
+
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, _add)
             logger.debug("Memory stored for conversation with user '%s'", uid)
         except Exception as e:
             logger.warning("Failed to store memory: %s", e)
@@ -129,18 +135,23 @@ class MemoryManager:
         Retrieve relevant context for a query.
 
         Returns list of memory strings ranked by relevance.
+        Runs in a thread pool to avoid blocking the asyncio event loop.
         """
         if not self._config.enabled or not self._memory:
             return []
 
         uid = user_id or self._user_id
 
-        try:
-            results = self._memory.search(
+        def _search():
+            return self._memory.search(
                 query=query,
                 user_id=uid,
                 limit=limit,
             )
+
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(None, _search)
             memories = [entry["memory"] for entry in results.get("results", [])]
             logger.debug("Retrieved %d memories for query", len(memories))
             return memories
@@ -156,8 +167,13 @@ class MemoryManager:
             return []
 
         uid = user_id or self._user_id
-        try:
+
+        def _get_all():
             return self._memory.get_all(user_id=uid)
+
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(None, _get_all)
         except Exception as e:
             logger.warning("Failed to get all memories: %s", e)
             return []

@@ -17,6 +17,7 @@ numpy>=1.24                     # Audio array processing
 
 # --- Voice: Text-to-Speech ---
 kokoro>=0.9.0                   # Kokoro TTS (82M, CPU-friendly)
+piper-tts>=1.2.0                # Piper TTS (ONNX, ultra-low latency)
 soundfile>=0.12.0               # Audio file I/O
 
 # --- Voice: Wake Word ---

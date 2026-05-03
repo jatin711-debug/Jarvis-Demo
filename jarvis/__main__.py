@@ -1,17 +1,30 @@
 """JARVIS entry point — python -m jarvis"""
 
-# ── Suppress ALL noisy library warnings before any imports ──
-import warnings
+# ── Suppress ALL noisy library warnings BEFORE any imports ──
 import os
 import sys
 
-# Nuclear option: silence everything (DeprecationWarning, FutureWarning, UserWarning)
-warnings.simplefilter("ignore")
+# Set env vars FIRST - before any imports
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["PYTHONWARNINGS"] = "ignore"
-# Also suppress via sys.warnoptions so child threads respect it
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "0"
 if not sys.warnoptions:
     os.environ["PYTHONWARNINGS"] = "ignore"
+
+# NOW suppress warnings and logging
+import warnings
+warnings.simplefilter("ignore")
+
+import logging
+
+# Suppress all noisy loggers by attaching null handler
+_null_handler = logging.NullHandler()
+for _name in ["tensorflow", "NumExpr", "torch", "transformers",
+              "httpx", "httpcore", "requests"]:
+    _logger = logging.getLogger(_name)
+    _logger.addHandler(_null_handler)
+    _logger.setLevel(50)
 
 import argparse
 import asyncio

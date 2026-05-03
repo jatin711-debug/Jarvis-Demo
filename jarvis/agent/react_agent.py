@@ -86,8 +86,9 @@ _LFM_TOOL_CALL_END = "<|tool_call_end|>"
 
 def _parse_tool_call(text: str) -> dict[str, Any] | None:
     """
-    Try to extract a tool call JSON from the LLM response.
-    Handles various formats: raw JSON, markdown code blocks, LFM format.
+    Try to extract a tool call from the LLM response.
+    Handles various formats: raw JSON, markdown code blocks, LFM format,
+    and common LLM variations (missing brackets, partial tokens, etc.).
 
     LFM format: <|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
     """
@@ -96,35 +97,70 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
         parsed["tool"] = re.sub(r"\(.*\)$", "", parsed["tool"]).strip()
         return parsed
 
-    # Try LFM format first: <|tool_call_start|>[tool_name(...) ]<|tool_call_end|>
-    if _LFM_TOOL_CALL_START in text:
-        pattern = re.escape(_LFM_TOOL_CALL_START) + r"\[(.*?)\]" + re.escape(_LFM_TOOL_CALL_END)
-        lfm_match = re.search(pattern, text, re.DOTALL)
-        if lfm_match:
-            call_text = lfm_match.group(1).strip()
-            # Parse Python-style call: tool_name(arg="value", arg2=123)
-            func_match = re.match(r"(\w+)\((.*)\)", call_text)
-            if func_match:
-                tool_name = func_match.group(1)
-                args_str = func_match.group(2)
-                # Parse arguments
-                args = {}
-                arg_pattern = r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|(\d+\.?\d*))'
-                for m in re.finditer(arg_pattern, args_str):
-                    key = m.group(1)
-                    val = m.group(2) or m.group(3) or m.group(4)
-                    # Convert number strings to actual numbers
-                    try:
-                        if '.' in val:
-                            val = float(val)
-                        else:
-                            val = int(val)
-                    except (ValueError, TypeError):
-                        pass
-                    args[key] = val
-                return {"tool": tool_name, "args": args}
+    def _parse_func_call(call_text: str) -> dict[str, Any] | None:
+        """Parse a Python-style function call: tool_name(arg=\"value\", arg2=123)"""
+        func_match = re.match(r"(\w+)\((.*)\)", call_text, re.DOTALL)
+        if not func_match:
+            return None
+        tool_name = func_match.group(1)
+        args_str = func_match.group(2)
+        args = {}
+        # Parse arguments: key="value" or key='value' or key=123 or key=true/false
+        arg_pattern = r'(\w+)=(?:("(?:[^"\\]|\\.)*")|(\'(?:[^\'\\]|\\.)*\')|(\d+\.?\d*)|(true|false|True|False|NULL|null|None))'
+        for m in re.finditer(arg_pattern, args_str):
+            key = m.group(1)
+            val = m.group(2) or m.group(3) or m.group(4) or m.group(5)
+            if val is None:
+                continue
+            # Strip quotes from string values
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            # Convert number strings to actual numbers
+            try:
+                if '.' in str(val):
+                    val = float(val)
+                else:
+                    val = int(val)
+            except (ValueError, TypeError):
+                pass
+            # Convert booleans/nulls
+            if isinstance(val, str):
+                lower = val.lower()
+                if lower in ("true", "True"):
+                    val = True
+                elif lower in ("false", "False"):
+                    val = False
+                elif lower in ("null", "none", "NULL", "None"):
+                    val = None
+            args[key] = val
+        return {"tool": tool_name, "args": args}
 
-    # Try to find JSON in code blocks first
+    # ── LFM format (flexible) ──
+    # Try exact tokens first, then looser variants
+    lfm_variants = [
+        # Exact with square brackets
+        (re.escape(_LFM_TOOL_CALL_START) + r"\[(.*?)\]" + re.escape(_LFM_TOOL_CALL_END)),
+        # Without square brackets
+        (re.escape(_LFM_TOOL_CALL_START) + r"(.*?)" + re.escape(_LFM_TOOL_CALL_END)),
+    ]
+    for pattern in lfm_variants:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            call_text = match.group(1).strip()
+            parsed = _parse_func_call(call_text)
+            if parsed:
+                return parsed
+
+    # ── Loose heuristic: any func(args) near tool call markers ──
+    if "tool_call" in text.lower():
+        # Look for tool_name(args) anywhere in the text
+        func_match = re.search(r"(\w+)\((.*?)\)", text, re.DOTALL)
+        if func_match:
+            parsed = _parse_func_call(func_match.group(0))
+            if parsed:
+                return parsed
+
+    # ── JSON code blocks ──
     code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if code_block:
         try:
@@ -134,10 +170,9 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             pass
 
-    # Try to find raw JSON with tool key
+    # ── Raw JSON with tool key ──
     json_match = re.search(r'\{\s*"tool"\s*:', text)
     if json_match:
-        # Find the matching closing brace
         start = json_match.start()
         brace_count = 0
         for i, ch in enumerate(text[start:], start):
@@ -285,9 +320,14 @@ class ReActAgent:
 
             response = await self.llm.chat(messages=messages)
             content = response.get("message", {}).get("content", "")
+            thinking = response.get("message", {}).get("thinking", "")
             logger.info("🧠 LLM raw (iter %d): %s", iteration + 1, content[:300])
+            if thinking:
+                logger.debug("🧠 LLM thinking (iter %d): %s", iteration + 1, thinking[:300])
 
             if not content:
+                logger.warning("⚠️ Empty LLM response (iter %d). Prompt had %d chars, %d messages. Thinking length: %d chars",
+                               iteration + 1, len(self._build_system_prompt(context, include_browser=include_browser)), len(messages), len(thinking))
                 return "I couldn't generate a response."
 
             # Strip <think>...</think> tags for parsing (but keep for context)
@@ -404,9 +444,14 @@ class ReActAgent:
             # Non-final iterations: use regular (non-streamed) chat
             response = await self.llm.chat(messages=messages)
             content = response.get("message", {}).get("content", "")
+            thinking = response.get("message", {}).get("thinking", "")
             logger.info("🧠 LLM raw (iter %d): %s", iteration + 1, content[:300])
+            if thinking:
+                logger.debug("🧠 LLM thinking (iter %d): %s", iteration + 1, thinking[:300])
 
             if not content:
+                logger.warning("⚠️ Empty LLM response (stream iter %d). Prompt had %d messages. Thinking length: %d chars",
+                               iteration + 1, len(messages), len(thinking))
                 yield "I couldn't generate a response."
                 return
 

@@ -30,10 +30,10 @@ voice:
     piper_model: "en_US-lessac-medium.onnx"  # Piper ONNX voice model
 # --- LLM (Multi-backend support) ---
 llm:
-  provider: "vllm"          # "ollama", "vllm", "huggingface"
-  model: "qwen3:1.7b"       # Model name (depends on provider)
-  base_url: "http://localhost:8000"  # vLLM default port
-  max_tokens: 256              # short for voice responses
+  provider: "ollama"        # "ollama" or "huggingface"
+  model: "qwen2.5:3b"      # Model name (depends on provider)
+  base_url: "http://localhost:11434"  # Ollama default port
+  max_tokens: 512              # short voice responses
   temperature: 0.1            # LFM recommended (also works for Qwen)
   top_p: 0.9
   top_k: 50                   # LFM recommended
@@ -52,6 +52,7 @@ llm:
     - For time/date questions, use the get_datetime tool
     - open_application is ONLY for desktop apps (notepad, calculator, etc.)
     - For web tasks, use the browser_* tools
+    - Do not think step-by-step. Respond immediately without reasoning.
 
     To call tools, use this format:
     <|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
