@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import psutil
 
@@ -26,6 +27,7 @@ logger = get_logger(__name__)
 def register_system_tools(
     registry: ToolRegistry,
     security: SecurityConfig,
+    llm_client: Any = None,
 ) -> None:
     """Register all built-in system tools."""
 
@@ -967,32 +969,57 @@ def register_system_tools(
     async def web_search(query: str, num_results: int = 5) -> str:
         try:
             import httpx
-            # Use DuckDuckGo HTML search (no API key needed)
+            import re
+            import urllib.parse
+
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     "https://html.duckduckgo.com/html/",
-                    params={"q": query, "b": num_results},
+                    params={"q": query, "kl": "us-en"},
                     timeout=15.0,
+                    headers={"User-Agent": "Mozilla/5.0"},
                 )
-                # Simple regex parsing for results
-                import re
+                text = resp.text
                 results = []
-                for match in re.finditer(
-                    r'<a class="result__a" href="([^"]+)"[^>]*>([^<]+)</a>.*?'
-                    r'<a class="result__snippet"[^>]*>([^<]+)</a>',
-                    resp.text, re.DOTALL
-                ):
-                    url, title, snippet = match.groups()
-                    if len(results) >= num_results:
+
+                # Find all result blocks
+                titles = list(re.finditer(
+                    r'class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', text
+                ))
+                snippets = re.findall(
+                    r'class="result__snippet"[^>]*>(.*?)</a>', text
+                )
+
+                for i, tmatch in enumerate(titles):
+                    if i >= num_results or i >= len(snippets):
                         break
+
+                    raw_url = tmatch.group(1)
+                    # Strip HTML tags from title
+                    title = re.sub(r'<[^>]+>', '', tmatch.group(2)).strip()
+                    # Strip HTML tags from snippet
+                    snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+
+                    # Decode DuckDuckGo redirect URLs
+                    if raw_url.startswith("//duckduckgo.com/l/?uddg="):
+                        real_url = urllib.parse.unquote(
+                            raw_url.split("uddg=")[1]
+                        )
+                    else:
+                        real_url = raw_url
+                    # Strip DuckDuckGo tracking param
+                    real_url = re.split(r'[&]amp;rut=', real_url)[0]
+                    real_url = re.split(r'[&]rut=', real_url)[0]
+
                     results.append(
-                        f"• {title.strip()}\n  {snippet.strip()[:200]}\n  {url}"
+                        f"• {title}\n  {snippet[:200]}\n  {real_url}"
                     )
+
                 if results:
-                    return f"🔍 Results for '{query}':\n\n" + "\n\n".join(results)
+                    return f"Results for '{query}':\n\n" + "\n\n".join(results)
                 return f"No results found for '{query}'"
         except Exception as e:
-            return f"❌ Search error: {e}"
+            return f"Search error: {e}"
 
     # ── System Uptime ──
 
@@ -1016,5 +1043,10 @@ def register_system_tools(
                 return f"Uptime: {uptime.format_timespan(uptime.uptime())}"
         except Exception as e:
             return f"❌ Error: {e}"
+
+    # Register vision tools if LLM client is available
+    if llm_client is not None:
+        from jarvis.tools.vision_tools import register_vision_tools
+        register_vision_tools(registry, llm_client)
 
     logger.info("✅ Registered %d system tools", len(registry))

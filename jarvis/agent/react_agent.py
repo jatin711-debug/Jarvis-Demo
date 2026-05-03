@@ -567,3 +567,268 @@ class ReActAgent:
             yield "I've completed what I could. Let me know if you need anything else."
         else:
             yield content if content else "I ran into too many steps. Please try again."
+
+
+    # ==========================================================================
+    # AUTONOMOUS RESEARCH MODE
+    # ==========================================================================
+
+    async def research(self, query: str, max_sources: int = 5) -> str:
+        """
+        Perform autonomous research on a topic.
+
+        The agent will:
+        1. Search the web for relevant sources
+        2. Browse and read promising pages
+        3. Extract key information
+        4. Compile a concise summary report
+
+        Args:
+            query: The research question or topic
+            max_sources: Maximum number of sources to consult
+
+        Returns:
+            A research summary with sources cited
+        """
+        logger.info("Starting research on: %s", query[:80])
+
+        system_prompt = (
+            "You are a research analyst. Your goal is to thoroughly investigate "
+            "the user's query using web search and browser tools, then compile "
+            "a concise, factual summary with citations.\n\n"
+            "RESEARCH PROCESS:\n"
+            "1. Use web_search to find relevant sources\n"
+            "2. Use open_url to read promising pages\n"
+            "3. Use read_pdf if PDF documents are found\n"
+            "4. Synthesize findings into a brief report\n\n"
+            "RULES:\n"
+            "- Be factual and cite your sources\n"
+            "- Limit to the most relevant information\n"
+            "- If search returns no results, say so\n"
+            "- Respond with a concise summary suitable for spoken TTS"
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Research this topic and give me a summary: {query}"},
+        ]
+
+        # Use the standard ReAct loop but with research-specific prompt
+        self._seen_tool_calls: set[tuple[str, str]] = set()
+        tool_was_called = False
+        sources_consulted = 0
+
+        for iteration in range(MAX_ITERATIONS):
+            response = await self.llm.chat(messages=messages)
+            content = response.get("message", {}).get("content", "")
+            logger.info("Research iter %d: %s", iteration + 1, content[:300])
+
+            if not content:
+                return "I couldn't complete the research."
+
+            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            tool_call = _parse_tool_call(content) or _parse_tool_call(cleaned)
+
+            if tool_call is None:
+                return cleaned if cleaned else content
+
+            tool_name = tool_call.get("tool", "")
+            tool_args = tool_call.get("args", {})
+
+            # Track sources
+            if tool_name in ("open_url", "read_pdf"):
+                sources_consulted += 1
+                if sources_consulted > max_sources:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"You've consulted {max_sources} sources. "
+                            "Please synthesize what you've learned into a final summary now."
+                        ),
+                    })
+                    continue
+
+            # Prevent repeats
+            call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
+            if call_key in self._seen_tool_calls:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You already consulted that source. "
+                        "Please synthesize your findings into a final summary."
+                    ),
+                })
+                continue
+            self._seen_tool_calls.add(call_key)
+
+            tool_was_called = True
+            messages.append({"role": "assistant", "content": content})
+
+            try:
+                result = await self._execute_tool(tool_name, **tool_args)
+                result_str = str(result)[:4000]  # Limit context length
+            except Exception as e:
+                result_str = f"Error: {e}"
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Tool '{tool_name}' result:\n{result_str}\n\n"
+                    f"Continue researching or provide your final summary."
+                ),
+            })
+
+        return "Research complete. Here is what I found:\n\n" + (content if content else "")
+
+    # ==========================================================================
+    # SEE-THINK-ACT DESKTOP AUTOMATION LOOP
+    # ==========================================================================
+
+    async def computer_use(self, goal: str, max_steps: int = 15) -> str:
+        """
+        Autonomously accomplish a desktop task via screenshot → think → act loop.
+
+        Two-phase approach:
+        1. PLANNING: Model creates a step-by-step plan without screenshots
+        2. EXECUTION: Each step is executed with screenshot verification
+
+        Args:
+            goal: The desktop task to accomplish (e.g., "Open Notepad and type Hello")
+            max_steps: Maximum number of action iterations
+
+        Returns:
+            A summary of what was accomplished
+        """
+        logger.info("Computer-use mode: %s", goal[:80])
+
+        import base64, io
+        import pyautogui
+
+        # ── Phase 1: Planning ──
+        plan_prompt = (
+            f"Goal: {goal}\n\n"
+            "Create a concise step-by-step plan to accomplish this goal. "
+            "Each step must use one of these tools:\n"
+            "- open_application(app_name) — launch an app by name\n"
+            "- click_ui_element(element_name) — click a visible UI element\n"
+            "- type_text(text) — type text at current cursor\n"
+            "- send_keystrokes(keys) — press keys like 'win+r', 'ctrl+a'\n\n"
+            "Format your plan as a numbered list. Be specific with element names."
+        )
+
+        plan_resp = await self.llm.chat(messages=[
+            {"role": "system", "content": "You are a desktop automation planner."},
+            {"role": "user", "content": plan_prompt},
+        ])
+        plan = plan_resp.get("message", {}).get("content", "")
+        logger.info("Computer-use plan:\n%s", plan)
+
+        # Extract steps from plan (look for numbered lines with tool names)
+        steps: list[dict[str, Any]] = []
+        for line in plan.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Try to find tool calls in the plan line
+            tc = _parse_tool_call(line)
+            if tc is None:
+                # Fallback: look for patterns like "open_application(..."
+                m = re.search(r"(\w+)\s*\(([^)]*)\)", line)
+                if m:
+                    tname = m.group(1)
+                    targs = m.group(2).strip()
+                    args: dict[str, Any] = {}
+                    # Named args: param="value" or param='value'
+                    for kv in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', targs):
+                        args[kv.group(1)] = kv.group(2)
+                    for kv in re.finditer(r"(\w+)\s*=\s*'(.*?)'", targs):
+                        args[kv.group(1)] = kv.group(2)
+                    # Positional args: "value", 'value', or bareword — map to known params
+                    if not args and targs:
+                        pos = re.search(r'^["\']([^"\']+)["\']$', targs)
+                        if pos:
+                            val = pos.group(1)
+                        else:
+                            val = targs  # bareword like notepad
+                        param_map = {
+                            "open_application": "app_name",
+                            "click_ui_element": "element_name",
+                            "type_text": "text",
+                            "send_keystrokes": "keys",
+                            "take_screenshot": "save_path",
+                        }
+                        if tname in param_map:
+                            args[param_map[tname]] = val
+                    tc = {"tool": tname, "args": args}
+            if tc:
+                steps.append(tc)
+
+        if not steps:
+            return f"Could not create a plan for: {goal}"
+
+        logger.info("Parsed %d executable steps", len(steps))
+
+        # ── Phase 2: Execution ──
+        system_prompt = (
+            "You are verifying desktop automation steps. "
+            "A screenshot is attached. Confirm if the expected UI state is visible. "
+            "If yes, say CONTINUE. If no, say ADJUST: <alternative action>"
+        )
+
+        actions_taken: list[str] = []
+
+        for step_idx, step in enumerate(steps[:max_steps]):
+            tool_name = step.get("tool", "")
+            tool_args = step.get("args", {})
+
+            logger.info("Step %d/%d: %s(%s)", step_idx + 1, len(steps), tool_name, tool_args)
+
+            # Execute the planned action
+            try:
+                result = await self._execute_tool(tool_name, **tool_args)
+                result_str = str(result)[:500]
+                actions_taken.append(f"{tool_name}({tool_args}) -> {result_str[:100]}")
+            except Exception as e:
+                result_str = f"Error: {e}"
+                actions_taken.append(f"{tool_name}({tool_args}) -> FAILED: {e}")
+
+            logger.info("Step %d result: %s", step_idx + 1, result_str[:200])
+
+            # Screenshot verification (optional but helpful for debugging)
+            if step_idx < len(steps) - 1:
+                img = pyautogui.screenshot()
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+                verify_msg = (
+                    f"Goal: {goal}\n"
+                    f"Just executed: {tool_name}({tool_args})\n"
+                    f"Result: {result_str[:200]}\n\n"
+                    "Is the next step ready to execute? Reply CONTINUE or ADJUST: <new action>"
+                )
+
+                verify_resp = await self.llm.chat(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": verify_msg, "images": [img_b64]},
+                    ]
+                )
+                verify = verify_resp.get("message", {}).get("content", "").strip().upper()
+                logger.debug("Verification: %s", verify)
+
+                if verify.startswith("ADJUST:"):
+                    # Parse alternative action
+                    alt_text = verify[7:].strip()
+                    alt_tc = _parse_tool_call(alt_text)
+                    if alt_tc:
+                        steps.insert(step_idx + 1, alt_tc)
+                        logger.info("Adjusted plan: added %s", alt_tc)
+
+        return (
+            f"Task: {goal}\n\n"
+            f"Plan executed ({len(actions_taken)} steps):\n"
+            + "\n".join(f"{i+1}. {a}" for i, a in enumerate(actions_taken))
+        )

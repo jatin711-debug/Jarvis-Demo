@@ -38,3 +38,9 @@ psutil>=5.9                     # System info
 
 # --- Web Automation ---
 playwright>=1.40                # Browser automation (Chromium/Firefox/WebKit)
+
+# --- Vision & Document Reading ---
+pdfplumber>=0.11.0              # PDF text extraction
+PyPDF2>=3.0.0                   # PDF parsing fallback
+pandas>=2.0.0                   # Spreadsheet reading
+openpyxl>=3.1.0                 # Excel (.xlsx) support

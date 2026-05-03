@@ -92,19 +92,19 @@ class ToolRegistry:
         """Get a tool by name."""
         return self._tools.get(name)
 
-    async def execute(self, name: str, **kwargs: Any) -> Any:
+    async def execute(self, tool_name: str, **kwargs: Any) -> Any:
         """Execute a tool by name with the given arguments."""
-        tool = self._tools.get(name)
+        tool = self._tools.get(tool_name)
         if not tool:
-            raise ValueError(f"Unknown tool: {name}")
+            raise ValueError(f"Unknown tool: {tool_name}")
 
-        logger.info("🔧 Executing tool: %s(%s)", name, kwargs)
+        logger.info("Executing tool: %s(%s)", tool_name, kwargs)
         try:
             result = await tool.handler(**kwargs)
-            logger.info("✅ Tool '%s' completed", name)
+            logger.info("Tool '%s' completed", tool_name)
             return result
         except Exception as e:
-            logger.error("❌ Tool '%s' failed: %s", name, e)
+            logger.error("Tool '%s' failed: %s", tool_name, e)
             raise
 
     def get_ollama_tools(self) -> list[dict[str, Any]]:

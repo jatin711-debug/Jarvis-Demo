@@ -22,7 +22,7 @@ async def test():
     # 2. Tool registry
     print("2. Registering tools...")
     tools = ToolRegistry()
-    register_system_tools(tools, config.security)
+    register_system_tools(tools, config.security, llm_client=llm)
     print(f"   Registered tools: {tools.list_tools()}")
     
     # 3. Agent

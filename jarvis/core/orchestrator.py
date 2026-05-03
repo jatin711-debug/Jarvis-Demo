@@ -138,7 +138,7 @@ class Orchestrator:
 
         # 4. Tools — system tools always loaded, browser tools on-demand
         self.tools = ToolRegistry()
-        register_system_tools(self.tools, cfg.security)
+        register_system_tools(self.tools, cfg.security, llm_client=self.llm)
 
         self._browser_tools = ToolRegistry()
         register_browser_tools(self._browser_tools)
