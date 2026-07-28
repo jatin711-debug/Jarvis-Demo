@@ -9,12 +9,13 @@ Multi-provider LLM client:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
-from jarvis.utils.logger import get_logger
 from jarvis.utils.config import LLMConfig
+from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -49,16 +50,47 @@ class LLMClient:
             await self._startup_ollama()
 
     async def _startup_ollama(self) -> None:
-        """Initialize Ollama HTTP client."""
+        """Initialize Ollama HTTP client and verify the configured model exists."""
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(120.0, connect=10.0),
         )
 
-        if await self.health_check():
-            logger.info("✅ Ollama connected at %s", self.base_url)
-        else:
-            logger.error("❌ Cannot reach Ollama at %s", self.base_url)
+        models = await self.list_models()
+        if models is None:
+            await self._client.aclose()
+            self._client = None
+            raise RuntimeError(
+                f"Cannot reach Ollama at {self.base_url}. "
+                "Start it with `ollama serve` and try again."
+            )
+
+        if not any(self._model_name_matches(m) for m in models):
+            await self._client.aclose()
+            self._client = None
+            raise RuntimeError(
+                f"Model '{self.config.model}' is not pulled. "
+                f"Run: ollama pull {self.config.model}\n"
+                f"Available models: {', '.join(models) or '(none)'}"
+            )
+
+        logger.info("✅ Ollama connected at %s (model=%s)", self.base_url, self.config.model)
+
+    def _model_name_matches(self, tag: str) -> bool:
+        """Match 'qwen3:4b' against tags like 'qwen3:4b' or 'name:latest'."""
+        want = self.config.model
+        return tag == want or tag == f"{want}:latest"
+
+    async def list_models(self) -> list[str] | None:
+        """Return pulled model names, or None if Ollama is unreachable."""
+        try:
+            assert self._client is not None
+            resp = await self._client.get(_API_TAGS)
+            resp.raise_for_status()
+            return [m.get("name", "") for m in resp.json().get("models", [])]
+        except Exception as e:
+            logger.warning("Ollama model list failed: %s", e)
+            return None
 
     async def _startup_huggingface(self) -> None:
         """Initialize HuggingFace Transformers model."""
@@ -100,18 +132,11 @@ class LLMClient:
         """Check if provider is running/available."""
         if self.provider == "huggingface":
             return self._hf_model is not None
-
-        try:
-            assert self._client is not None
-            resp = await self._client.get(_API_TAGS)
-            resp.raise_for_status()
-            models = resp.json().get("models", [])
-            model_names = [m.get("name", "") for m in models]
-            logger.debug("Available models: %s", model_names)
-            return True
-        except Exception as e:
-            logger.warning("Health check failed: %s", e)
+        models = await self.list_models()
+        if models is None:
             return False
+        logger.debug("Available models: %s", models)
+        return True
 
     def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
         """Apply chat template for HuggingFace models like LFM."""
@@ -255,36 +280,83 @@ class LLMClient:
         messages: list[dict[str, str]],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         """
         Stream a chat completion, yielding text chunks.
 
-        Note: Streaming only for final answer (not tool-call iterations).
+        Note: tool_calls arriving during the stream are silently collected;
+        use chat_stream_events() if you need them.
+        """
+        async for event in self.chat_stream_events(
+            messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, images=images,
+        ):
+            if event["type"] == "content":
+                yield event["text"]
+
+    async def chat_stream_events(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        images: list[str] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Stream a chat completion as structured events.
+
+        Yields {"type": "content", "text": <token>} for each text chunk,
+        then one terminal event:
+        {"type": "done", "content": <full text>, "tool_calls": [...]}.
         """
         if self.provider == "huggingface":
+            full_text = ""
             async for chunk in self._chat_stream_huggingface(
                 messages, temperature, max_tokens
             ):
-                yield chunk
-        else:
-            async for chunk in self._chat_stream_ollama(
-                messages, temperature, max_tokens
-            ):
-                yield chunk
+                full_text += chunk
+                yield {"type": "content", "text": chunk}
+            yield {"type": "done", "content": full_text, "tool_calls": []}
+            return
 
-    async def _chat_stream_ollama(
+        full_text = ""
+        tool_calls: list[dict[str, Any]] = []
+        async for kind, payload in self._stream_ollama(
+            messages, tools, temperature, max_tokens, images
+        ):
+            if kind == "content":
+                full_text += payload
+                yield {"type": "content", "text": payload}
+            elif kind == "tool_calls":
+                tool_calls.extend(payload)
+        yield {"type": "done", "content": full_text, "tool_calls": tool_calls}
+
+    async def _stream_ollama(
         self,
         messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-    ) -> AsyncIterator[str]:
-        """Stream via Ollama API."""
+        images: list[str] | None = None,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Raw Ollama stream: yields ("content", token) or ("tool_calls", [...])."""
         assert self._client is not None, "Call startup() first"
+
+        # Attach images to the last user message if provided
+        msgs = [dict(m) for m in messages]
+        if images and msgs:
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "user":
+                    msgs[i]["images"] = images
+                    break
 
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": messages,
+            "messages": msgs,
             "stream": True,
+            "keep_alive": "30m",
             "options": {
                 "temperature": temperature or self.config.temperature,
                 "top_p": self.config.top_p,
@@ -297,21 +369,42 @@ class LLMClient:
         if "qwen3.5" in self.config.model.lower():
             payload["think"] = False
 
+        if tools:
+            payload["tools"] = tools
+
         async with self._client.stream("POST", _API_CHAT, json=payload) as resp:
             resp.raise_for_status()
+            import json as _json
             async for line in resp.aiter_lines():
                 if not line.strip():
                     continue
-                import json as _json
                 try:
                     data = _json.loads(line)
                 except Exception:
                     continue
-                token = data.get("message", {}).get("content", "")
+                message = data.get("message", {})
+                token = message.get("content", "")
                 if token:
-                    yield token
+                    yield ("content", token)
+                calls = message.get("tool_calls")
+                if calls:
+                    yield ("tool_calls", calls)
                 if data.get("done", False):
                     break
+
+    async def _chat_stream_ollama(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        images: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream via Ollama API (text tokens only)."""
+        async for kind, payload in self._stream_ollama(
+            messages, None, temperature, max_tokens, images
+        ):
+            if kind == "content":
+                yield payload
 
     async def _chat_stream_huggingface(
         self,

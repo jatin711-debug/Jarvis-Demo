@@ -1,22 +1,23 @@
 """Test Mem0.ai integration with local Ollama models."""
 import asyncio
 import sys
+
 sys.path.insert(0, ".")
 
-from jarvis.utils.config import load_config
 from jarvis.memory.manager import MemoryManager
+from jarvis.utils.config import load_config
 
 
 async def test_memory():
     config = load_config()
-    
+
     print("1. Initializing memory manager...")
     # Change the path to a temporary test directory so we don't pollute real memories
     config.memory.vector_store.path = "./.jarvis_test/vectors"
-    
+
     manager = MemoryManager(config.memory, config.llm)
     await manager.startup()
-    
+
     if not manager._memory:
         print("❌ Mem0 failed to initialize")
         return
@@ -28,13 +29,13 @@ async def test_memory():
         "Nice to meet you, Alex! I'll remember your programming preferences.",
         user_id="test_user"
     )
-    
+
     await manager.add_conversation(
         "Can you remind me of my favorite coffee?",
         "I don't know your favorite coffee yet.",
         user_id="test_user"
     )
-    
+
     await manager.add_conversation(
         "Oh right. It's an iced latte with oat milk.",
         "Got it! I've updated your preferences.",
@@ -43,11 +44,11 @@ async def test_memory():
 
     print("3. Retrieving context for 'What drinks do I like?'...")
     context = await manager.get_context("What drinks do I like?", user_id="test_user")
-    
+
     print(f"\nRetrieved {len(context)} memories:")
     for i, mem in enumerate(context, 1):
         print(f"  {i}. {mem}")
-        
+
     print("\n4. Getting all explicitly saved memories...")
     all_memories = await manager.get_all_memories(user_id="test_user")
     print(f"\nTotal memories in DB: {len(all_memories)}")

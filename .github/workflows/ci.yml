@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The unit suite only exercises pure logic (parsing, config, security,
+      # agent loop with a mocked LLM), so we skip the heavy runtime deps
+      # (torch, kokoro, playwright, pyaudio, ...) and install just what the
+      # imported modules need.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . --no-deps
+          pip install pytest pytest-asyncio ruff \
+            httpx pydantic pyyaml psutil rich numpy soundfile
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Test (pytest)
+        run: pytest -q

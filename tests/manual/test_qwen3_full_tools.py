@@ -1,6 +1,8 @@
 """Test Qwen3 with ALL 29 system tools in the prompt."""
 import asyncio
+
 import httpx
+
 
 async def test():
     # Exact tool descriptions copied from agent's _build_tool_descriptions output

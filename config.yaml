@@ -8,6 +8,7 @@ system:
   log_level: "DEBUG"           # DEBUG, INFO, WARNING, ERROR
   log_dir: "~/.jarvis/logs"
   data_dir: "~/.jarvis"
+  latency_report: true         # Log per-turn timing breakdown (record/STT/LLM/TTS)
 
 # --- Voice Pipeline ---
 voice:
@@ -15,6 +16,7 @@ voice:
   sensitivity: 0.4            # Lowered for easier detection
   input_device: 2              # JBL Tune 520BT (use null for system default)
   output_device: null          # null = system default
+  barge_in: true               # Let the user interrupt Jarvis mid-response by speaking
 
   stt:
     model: "distil-small.en"   # Distilled Whisper: 2-4x faster, same accuracy
@@ -23,15 +25,15 @@ voice:
     compute_type: "int8"       # int8 for CPU, float16 for GPU
 
   tts:
-    engine: "piper"            # piper (ultra-fast ~150ms) or kokoro (high quality)
-    voice: "af_heart"          # Kokoro voice preset (ignored when engine=piper)
+    engine: "kokoro"         # piper (ultra-fast ~150ms) or kokoro (high quality)
+    voice: "am_michael"      # Kokoro voice preset (ignored when engine=piper)
     speed: 1.0
     sample_rate: 24000
     piper_model: "en_US-lessac-medium.onnx"  # Piper ONNX voice model
 # --- LLM (Multi-backend support) ---
 llm:
   provider: "ollama"        # "ollama" or "huggingface"
-  model: "qwen3.5:4b"      # Model name (depends on provider)
+  model: "qwen3.5:2b"      # Q8_0, fits 4GB VRAM fully; vision+tools capable
   base_url: "http://localhost:11434"  # Ollama default port
   max_tokens: 512              # short voice responses
   temperature: 0.1            # LFM recommended (also works for Qwen)
@@ -73,9 +75,3 @@ security:
     - "~"
     - "C:\\"
     - "D:\\"
-
-# --- API Server ---
-server:
-  host: "127.0.0.1"
-  port: 8000
-  cors_origins: ["http://localhost:3000"]

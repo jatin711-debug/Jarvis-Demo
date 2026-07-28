@@ -4,14 +4,13 @@ Uses the multimodal LLM (qwen3.5:4b) for visual grounding and document understan
 """
 from __future__ import annotations
 
-import pandas as pd
-import asyncio
 import base64
 import io
-import json
 import re
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from jarvis.agent.llm_client import LLMClient
 from jarvis.agent.tool_registry import ToolRegistry
@@ -27,11 +26,13 @@ class VisionClient:
         self.llm = llm
 
     async def _screenshot_to_b64(self) -> str:
-        """Capture screen and return base64 PNG."""
+        """Capture screen, downsize for vision model, and return base64 PNG."""
         import pyautogui
         img = pyautogui.screenshot()
+        # Downsize to reduce vision encoder latency
+        img = img.resize((672, 448))
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG", optimize=True)
         return base64.b64encode(buf.getvalue()).decode()
 
     async def _ask_vision(

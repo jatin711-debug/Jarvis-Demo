@@ -1,7 +1,8 @@
 """Test Qwen3 with the EXACT agent prompt structure."""
 import asyncio
-import json
+
 import httpx
+
 
 async def test():
     # Realistic system prompt (agent personality + partial tool descriptions)

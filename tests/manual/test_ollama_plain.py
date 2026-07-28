@@ -1,7 +1,9 @@
 """Quick test: Ollama with plain system prompt (no special tokens)."""
 import asyncio
 import json
+
 import httpx
+
 
 async def test():
     payload = {

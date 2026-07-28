@@ -9,17 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
-from jarvis.core.events import EventBus
 from jarvis.agent.llm_client import LLMClient
-from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.agent.react_agent import ReActAgent
+from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.memory.manager import MemoryManager
-from jarvis.tools.system_tools import register_system_tools
 from jarvis.tools.browser_tools import register_browser_tools, shutdown_browser
-from jarvis.utils.logger import get_logger, setup_logging
+from jarvis.tools.system_tools import register_system_tools
 from jarvis.utils.config import expand_path
+from jarvis.utils.logger import get_logger, setup_logging
 
 if TYPE_CHECKING:
     from jarvis.utils.config import JarvisConfig
@@ -41,8 +41,10 @@ _GIBBERISH_RE = re.compile(r"(\b\w+\b)(\W+\1\b){2,}")  # same word 3+ times
 
 def _is_hallucination(text: str, audio_bytes: bytes) -> bool:
     """Detect likely Whisper hallucinations on very short / quiet audio."""
+    import io
+
     import numpy as np
-    import io, soundfile as sf
+    import soundfile as sf
 
     cleaned = text.strip().lower().rstrip(".!?,")
     if cleaned in _HALLUCINATION_PHRASES:
@@ -64,23 +66,14 @@ def _is_garbage(text: str) -> bool:
     if not stripped:
         return True
 
-    # Very short (< 3 words) and not a known command or dismissal
-    words = stripped.split()
-    if len(words) < 3:
-        low = stripped.lower().rstrip(".!?,")
-        known_short = {
-            "yes", "no", "ok", "okay", "stop", "exit", "quit", "bye",
-            "thanks", "thank you", "done", "goodbye", "jarvis",
-        }
-        if low not in known_short:
-            logger.debug("Garbage filtered (too short): '%s'", text)
-            return True
-
     # Heavy repetition / stuttering (e.g. "oh. oh. oh.")
     if _GIBBERISH_RE.search(stripped):
         logger.debug("Garbage filtered (repetition): '%s'", text)
         return True
 
+    # NOTE: no length filtering — short commands like "open notepad" or
+    # "take screenshot" are legitimate voice commands. Whisper
+    # hallucinations are handled separately by _is_hallucination().
     return False
 
 logger = get_logger(__name__)
@@ -98,7 +91,6 @@ class Orchestrator:
 
     def __init__(self, config: JarvisConfig) -> None:
         self.config = config
-        self.event_bus = EventBus()
         self._running = False
 
         # Core services
@@ -160,6 +152,12 @@ class Orchestrator:
         # 7. Voice stack
         await self._init_voice(cfg)
 
+        # 8. Wire confirmation for dangerous tools (voice yes/no)
+        if cfg.security.confirm_dangerous_ops:
+            self.tools.set_confirm_callback(self._confirm_tool)
+            self._browser_tools.set_confirm_callback(self._confirm_tool)
+            logger.info("🔒 Voice confirmation enabled for dangerous tools")
+
         self._running = True
         logger.info("✅ All services initialized")
 
@@ -169,7 +167,7 @@ class Orchestrator:
 
     async def _init_voice(self, cfg: JarvisConfig) -> None:
         """Initialize TTS, STT, and WakeWord engines."""
-        from jarvis.voice.implementations import KokoroTTS, PiperTTS, WhisperSTT, OpenWakeWordEngine
+        from jarvis.voice.implementations import KokoroTTS, OpenWakeWordEngine, PiperTTS, WhisperSTT
 
         engine = cfg.voice.tts.engine.lower()
         if engine == "piper":
@@ -189,10 +187,10 @@ class Orchestrator:
         assert self.agent is not None
         assert self.memory is not None
 
-        # 1. Retrieve relevant memories
+        # 1. Retrieve relevant memories (parallelized inside agent if passed as task)
         context = await self.memory.get_context(text)
         if context:
-            logger.debug("📝 Retrieved %d memories", len(context))
+            logger.debug("Retrieved %d memories", len(context))
 
         # 2. Run through ReAct agent
         response = await self.agent.run(
@@ -219,10 +217,16 @@ class Orchestrator:
         assert self.agent is not None
         assert self.memory is not None
 
+        t_turn0 = time.monotonic()
         context = await self.memory.get_context(text)
+        t_memory = time.monotonic() - t_turn0
 
         full_response = ""
         sentence_buf = ""
+        interrupted = False
+        ttft: float | None = None
+        tts_total = 0.0
+        t_agent0 = time.monotonic()
         _SENTENCE_ENDERS = re.compile(r"[.!?]\s+|[.!?]$|\n")
 
         self.wake_word.suppress()
@@ -232,6 +236,8 @@ class Orchestrator:
                 conversation_history=self._conversation_history,
                 context=context,
             ):
+                if ttft is None:
+                    ttft = time.monotonic() - t_agent0
                 full_response += token
                 sentence_buf += token
 
@@ -242,16 +248,29 @@ class Orchestrator:
                     end = match.end()
                     sentence = sentence_buf[:end].strip()
                     sentence_buf = sentence_buf[end:]
-                    if sentence:
+                    if sentence and not interrupted:
                         logger.debug("🔊 Streaming sentence: %s", sentence[:80])
-                        await self.tts.speak(sentence)
+                        t_tts = time.monotonic()
+                        interrupted = await self._speak_interruptible(sentence)
+                        tts_total += time.monotonic() - t_tts
 
             # Speak any remaining text
             leftover = sentence_buf.strip()
-            if leftover:
-                await self.tts.speak(leftover)
+            if leftover and not interrupted:
+                t_tts = time.monotonic()
+                await self._speak_interruptible(leftover)
+                tts_total += time.monotonic() - t_tts
         finally:
             self.wake_word.unsuppress(cooldown=0.5)
+
+        agent_total = time.monotonic() - t_agent0
+        e2e = time.monotonic() - t_turn0
+        if self.config.system.latency_report:
+            logger.info(
+                "⏱️  memory=%.2fs llm_ttft=%.2fs agent=%.2fs tts=%.2fs e2e(agent+tts)=%.2fs%s",
+                t_memory, ttft or 0.0, agent_total, tts_total, e2e,
+                " [barge-in]" if interrupted else "",
+            )
 
         # Update conversation history
         self._conversation_history.append({"role": "user", "content": text})
@@ -272,6 +291,84 @@ class Orchestrator:
         finally:
             # Resume detection with cooldown so residual mic audio is ignored
             self.wake_word.unsuppress(cooldown=1.0)
+
+    async def _speak_interruptible(self, text: str) -> bool:
+        """
+        Speak a sentence, allowing the user to barge in by talking over it.
+        Returns True if playback was interrupted by user speech.
+        """
+        if not self.config.voice.barge_in:
+            await self.tts.speak(text)
+            return False
+
+        from jarvis.voice.implementations import wait_for_speech
+
+        cancel = asyncio.Event()
+        speak_task = asyncio.create_task(self.tts.speak(text))
+        monitor_task = asyncio.create_task(
+            wait_for_speech(self.config.voice.input_device, cancel_event=cancel)
+        )
+
+        interrupted = False
+        try:
+            done, _ = await asyncio.wait(
+                {speak_task, monitor_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if monitor_task in done and not speak_task.done():
+                try:
+                    interrupted = monitor_task.result()
+                except Exception as e:
+                    logger.debug("Barge-in monitor failed: %s", e)
+                if interrupted:
+                    self.tts.abort()
+        finally:
+            cancel.set()
+            results = await asyncio.gather(
+                speak_task, monitor_task, return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.debug("Speak/monitor task error: %s", r)
+
+        if interrupted:
+            logger.info("⏹️  Barge-in — response playback cut short")
+        return interrupted
+
+    async def _confirm_tool(self, tool_name: str, args: dict[str, Any]) -> bool:
+        """
+        Ask the user to confirm a dangerous tool call (voice yes/no).
+        Returns True only on an explicit yes.
+        """
+        from jarvis.voice.implementations import record_until_silence
+
+        if not self.tts or not self.stt:
+            logger.warning("Confirmation requested but voice stack unavailable — denying")
+            return False
+
+        arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
+        await self._speak_safe(
+            f"This will run {tool_name} with {arg_summary}. Say yes to confirm."
+        )
+
+        try:
+            audio = await record_until_silence(
+                sample_rate=16000,
+                silence_duration=1.2,
+                max_duration=6.0,
+                min_speech_duration=0.3,
+                input_device=self.config.voice.input_device,
+            )
+            text = (await self.stt.transcribe(audio)).strip().lower()
+        except Exception as e:
+            logger.error("Confirmation recording failed: %s — denying", e)
+            return False
+
+        confirmed = text.startswith(("yes", "yeah", "yep", "sure", "confirm", "ok", "okay"))
+        logger.info("Confirmation for %s: '%s' → %s", tool_name, text, confirmed)
+        if not confirmed:
+            await self._speak_safe("Cancelled.")
+        return confirmed
 
     async def _play_beep(self) -> None:
         """Play a short beep to indicate wake word detected."""
@@ -315,6 +412,7 @@ class Orchestrator:
         """
         from jarvis.voice.implementations import record_until_silence
 
+        t0 = time.monotonic()
         try:
             audio_bytes = await record_until_silence(
                 sample_rate=16000,
@@ -323,9 +421,15 @@ class Orchestrator:
         except Exception as e:
             logger.error("Recording failed: %s", e)
             return None
+        t_record = time.monotonic() - t0
 
+        t1 = time.monotonic()
         text = await self.stt.transcribe(audio_bytes)
         text = text.strip()
+        t_stt = time.monotonic() - t1
+
+        if self.config.system.latency_report:
+            logger.info("⏱️  record=%.2fs stt=%.2fs", t_record, t_stt)
 
         if not text or _is_hallucination(text, audio_bytes) or _is_garbage(text):
             logger.info("(empty, hallucinated, or garbage transcription, ignoring)")

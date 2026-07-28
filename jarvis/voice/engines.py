@@ -8,7 +8,7 @@ Full implementations will be added in Phase 1.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from jarvis.utils.logger import get_logger
 
@@ -60,6 +60,10 @@ class TTSEngine(ABC):
     async def speak(self, text: str) -> None:
         """Synthesize and play audio through speakers."""
         ...
+
+    def abort(self) -> None:
+        """Stop any ongoing playback immediately (barge-in). Optional."""
+        return
 
 
 class WakeWordEngine(ABC):

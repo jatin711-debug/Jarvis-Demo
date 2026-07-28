@@ -10,18 +10,59 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import psutil
 
 from jarvis.agent.tool_registry import ToolRegistry
-from jarvis.utils.logger import get_logger
 from jarvis.utils.config import SecurityConfig
+from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Command patterns that are blocked unconditionally — no config opt-out.
+# Everything else is subject to the whitelist/confirmation settings.
+_RM_ROOT = re.compile(
+    r"\brm\s+-\w*r\w*f\w*\s+(/|~|\*|[a-z]:[\\/]?)\s*$", re.IGNORECASE,
+)
+_DEL_SYS = re.compile(
+    r"\b(del|erase|rd|rmdir)\b[^|&]*/s[^|&]*(c:\\|c:/|%systemdrive%|\\windows\b|\\system32\b)",
+    re.IGNORECASE,
+)
+_FORMAT_DISK = re.compile(r"\bformat\s+[a-z]:", re.IGNORECASE)
+
+
+def _catastrophic_reason(command: str) -> str | None:
+    """Return a reason string if the command is catastrophically destructive."""
+    c = command.strip()
+    if _FORMAT_DISK.search(c):
+        return "formats a disk"
+    if re.search(r"\bdiskpart\b", c, re.IGNORECASE):
+        return "modifies disk partitions"
+    if _RM_ROOT.search(c):
+        return "recursively deletes a root/home directory"
+    if _DEL_SYS.search(c):
+        return "recursively deletes system paths"
+    if re.search(r"\bbcdedit\b", c, re.IGNORECASE):
+        return "modifies boot configuration"
+    return None
+
+
+def _first_executable(command: str) -> str:
+    """Extract the base executable name from a shell command line."""
+    first = command.strip().split()[0] if command.strip() else ""
+    # Strip quotes and path, keep basename without extension
+    first = first.strip("\"'")
+    base = os.path.basename(first).lower()
+    for ext in (".exe", ".bat", ".cmd", ".ps1", ".com"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    return base
 
 
 def register_system_tools(
@@ -30,6 +71,27 @@ def register_system_tools(
     llm_client: Any = None,
 ) -> None:
     """Register all built-in system tools."""
+
+    def _command_allowed(command: str) -> str | None:
+        """Security gate for run_command. Returns refusal reason or None."""
+        reason = _catastrophic_reason(command)
+        if reason:
+            return f"❌ Blocked: this command {reason}. Run it manually if you really mean it."
+
+        lowered = command.lower()
+        for blocked in security.blocked_commands:
+            if blocked and blocked.lower() in lowered:
+                return f"❌ Blocked by config blocklist: '{blocked}'"
+
+        if security.command_whitelist:
+            exe = _first_executable(command)
+            allowed = {a.lower() for a in security.allowed_commands}
+            if exe not in allowed:
+                return (
+                    f"❌ '{exe}' is not in the command whitelist. "
+                    "Add it to security.allowed_commands in config.yaml to allow it."
+                )
+        return None
 
     # ── Shell Command Execution ──
 
@@ -46,8 +108,13 @@ def register_system_tools(
             },
             "required": ["command"],
         },
+        requires_confirmation=True,
     )
     async def run_command(command: str) -> str:
+        refusal = _command_allowed(command)
+        if refusal:
+            logger.warning("run_command blocked: %s | %s", command, refusal)
+            return refusal
         try:
             result = await asyncio.create_subprocess_shell(
                 command,
@@ -62,7 +129,7 @@ def register_system_tools(
             if errors:
                 output += f"\n[stderr]: {errors}"
             return output or "(no output)"
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return "❌ Command timed out after 120 seconds."
         except Exception as e:
             return f"❌ Error: {e}"
@@ -100,7 +167,106 @@ def register_system_tools(
         "teams": "msteams:",
         "terminal": "wt",
         "windows terminal": "wt",
+        "vs code": "code",
+        "vscode": "code",
+        "visual studio code": "code",
+        "code": "code",
+        "chrome": "chrome",
+        "google chrome": "chrome",
+        "firefox": "firefox",
+        "edge": "msedge",
+        "microsoft edge": "msedge",
     }
+
+    def _resolve_app_windows(name: str) -> str | None:
+        """
+        Resolve an app name to something actually launchable on Windows:
+        alias table → PATH → Start Menu shortcuts → App Paths registry.
+        Returns None if the app can't be found.
+        """
+        key = name.strip().lower()
+
+        # 1. Alias table
+        if key in _WIN_ALIASES:
+            return _WIN_ALIASES[key]
+
+        # 2. Already on PATH
+        if shutil.which(name):
+            return name
+
+        # 3. Start Menu shortcuts (*.lnk)
+        start_menu_dirs = [
+            Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+            / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+            Path.home()
+            / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        ]
+        partial: str | None = None
+        for sm_dir in start_menu_dirs:
+            if not sm_dir.exists():
+                continue
+            try:
+                for lnk in sm_dir.rglob("*.lnk"):
+                    stem = lnk.stem.lower()
+                    if stem == key:
+                        return str(lnk)
+                    if partial is None and key in stem:
+                        partial = str(lnk)
+            except OSError:
+                continue
+        if partial:
+            return partial
+
+        # 4. App Paths registry (HKLM then HKCU)
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+                try:
+                    with winreg.OpenKey(root, base) as hive:
+                        i = 0
+                        while True:
+                            try:
+                                exe = winreg.EnumKey(hive, i)
+                            except OSError:
+                                break
+                            i += 1
+                            if key in exe.lower().removesuffix(".exe"):
+                                try:
+                                    with winreg.OpenKey(hive, exe) as sub:
+                                        path, _ = winreg.QueryValueEx(sub, "")
+                                        if path:
+                                            return path
+                                except OSError:
+                                    continue
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        return None
+
+    def _launch_windows(target: str) -> None:
+        """Launch a resolved target (lnk file, exe path, URI scheme, or PATH command)."""
+        lower = target.lower()
+        if lower.endswith(".lnk"):
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif lower.endswith(":") or "://" in lower:
+            # URI scheme (ms-settings:, xbox:, ...) — needs shell start
+            subprocess.Popen(
+                f'start "" "{target}"', shell=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif os.path.isabs(target) and Path(target).exists():
+            subprocess.Popen(
+                [target],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                f'start "" "{target}"', shell=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
     # ── Open Application ──
 
@@ -120,21 +286,20 @@ def register_system_tools(
     )
     async def open_application(app_name: str) -> str:
         try:
-            key = app_name.strip().lower()
             if platform.system() == "Windows":
-                cmd = _WIN_ALIASES.get(key, app_name)
-                subprocess.Popen(
-                    f'start "" "{cmd}"',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(
-                    [app_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                resolved = _resolve_app_windows(app_name)
+                if resolved is None:
+                    return (
+                        f"❌ Could not find an application named '{app_name}'. "
+                        "It may not be installed, or may need its full path."
+                    )
+                _launch_windows(resolved)
+                return f"✅ Launched '{app_name}' (via {resolved})"
+            subprocess.Popen(
+                [app_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return f"✅ Launched '{app_name}'"
         except Exception as e:
             return f"❌ Failed to launch '{app_name}': {e}"
@@ -411,6 +576,7 @@ def register_system_tools(
             },
             "required": ["path"],
         },
+        requires_confirmation=True,
     )
     async def delete_file(path: str) -> str:
         p = Path(path).expanduser().resolve()
@@ -495,6 +661,7 @@ def register_system_tools(
             },
             "required": ["target"],
         },
+        requires_confirmation=True,
     )
     async def kill_process(target: str) -> str:
         try:
@@ -675,8 +842,9 @@ def register_system_tools(
     )
     async def type_text(text: str, app: str = "") -> str:
         try:
-            import pyautogui
             import time
+
+            import pyautogui
 
             # If app specified, ensure it's open and focused
             if app:
@@ -735,8 +903,9 @@ def register_system_tools(
         if platform.system() != "Windows":
             return "❌ Only supported on Windows"
         try:
-            import pyautogui
             import time
+
+            import pyautogui
             windows = pyautogui.getWindowsWithTitle(title)
             if not windows:
                 return f"❌ No window found with title containing '{title}'"
@@ -765,8 +934,9 @@ def register_system_tools(
     )
     async def send_keystrokes(keys: str) -> str:
         try:
-            import pyautogui
             import time
+
+            import pyautogui
             time.sleep(0.3)  # Small delay for window focus
             if "+" in keys:
                 pyautogui.hotkey(*keys.split("+"))
@@ -860,8 +1030,9 @@ def register_system_tools(
     )
     async def http_request(url: str, method: str = "GET", headers: str = "", body: str = "") -> str:
         try:
-            import httpx
             import json as _json
+
+            import httpx
             hdrs = _json.loads(headers) if headers else {}
             bdy = _json.loads(body) if body else None
 
@@ -898,14 +1069,21 @@ def register_system_tools(
     async def scheduler_create(task_name: str, command: str, delay_seconds: int = 60) -> str:
         import subprocess
         try:
-            # Use Windows schtasks
-            task_cmd = f'schtasks /create /tn "Jarvis_{task_name}" /tr "{command}" /sc once /st +00:{delay_seconds}'
+            # schtasks /st expects a clock time (HH:MM) and /sd a date —
+            # compute them from the requested delay.
+            run_at = datetime.now() + timedelta(seconds=max(60, delay_seconds))
+            start_time = run_at.strftime("%H:%M")
+            start_date = run_at.strftime("%m/%d/%Y")
+            task_cmd = (
+                f'schtasks /create /tn "Jarvis_{task_name}" /tr "{command}" '
+                f"/sc once /st {start_time} /sd {start_date} /f"
+            )
             result = subprocess.run(
                 task_cmd, shell=True, capture_output=True, text=True
             )
             if result.returncode == 0:
-                return f"✅ Scheduled '{task_name}' to run in {delay_seconds}s"
-            return f"❌ Failed: {result.stderr}"
+                return f"✅ Scheduled '{task_name}' to run at {start_time} on {start_date}"
+            return f"❌ Failed: {result.stderr.strip() or result.stdout.strip()}"
         except Exception as e:
             return f"❌ Scheduler error: {e}"
 
@@ -968,9 +1146,10 @@ def register_system_tools(
     )
     async def web_search(query: str, num_results: int = 5) -> str:
         try:
-            import httpx
             import re
             import urllib.parse
+
+            import httpx
 
             async with httpx.AsyncClient() as client:
                 resp = await client.get(

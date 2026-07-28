@@ -1,46 +1,14 @@
 # ===========================
-# JARVIS - Core Dependencies
+# JARVIS - Dependencies
 # ===========================
-
-# --- LLM & Agent ---
-httpx>=0.27.0                   # Async HTTP client for Ollama API
-pydantic>=2.0                   # Data validation & settings
-
-# --- Memory ---
-mem0ai>=0.1.0                   # Mem0 memory layer
-chromadb>=0.5.0                 # Vector store (embedded)
-
-# --- Voice: Speech-to-Text ---
-faster-whisper>=1.0.0           # Whisper STT (CTranslate2 backend)
-sounddevice>=0.4.6              # Audio capture
-numpy>=1.24                     # Audio array processing
-
-# --- Voice: Text-to-Speech ---
-kokoro>=0.9.0                   # Kokoro TTS (82M, CPU-friendly)
-piper-tts>=1.2.0                # Piper TTS (ONNX, ultra-low latency)
-soundfile>=0.12.0               # Audio file I/O
-
-# --- Voice: Wake Word ---
-openwakeword>=0.6.0             # Wake word detection
-
-# --- Backend ---
-fastapi>=0.110.0                # API framework
-uvicorn[standard]>=0.29.0       # ASGI server
-websockets>=12.0                # WebSocket support
-
-# --- Config & Utilities ---
-pyyaml>=6.0                     # YAML config parsing
-rich>=13.0                      # Pretty terminal output
-
-# --- System Control ---
-pyautogui>=0.9.54               # GUI automation
-psutil>=5.9                     # System info
-
-# --- Web Automation ---
-playwright>=1.40                # Browser automation (Chromium/Firefox/WebKit)
-
-# --- Vision & Document Reading ---
-pdfplumber>=0.11.0              # PDF text extraction
-PyPDF2>=3.0.0                   # PDF parsing fallback
-pandas>=2.0.0                   # Spreadsheet reading
-openpyxl>=3.1.0                 # Excel (.xlsx) support
+# Dependencies are declared in pyproject.toml (single source of truth).
+# This file remains for `pip install -r requirements.txt` workflows;
+# it simply installs the project itself (with all runtime dependencies).
+#
+# Dev tools (pytest, ruff):  pip install -e .[dev]
+#
+# --- Post-install steps ---
+#   playwright install chromium        # browser automation tools
+#   ollama pull qwen3.5:2b             # chat model (see config.yaml llm.model)
+#   ollama pull nomic-embed-text       # embeddings for Mem0 memory
+-e .

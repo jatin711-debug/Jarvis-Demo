@@ -1,6 +1,8 @@
 """Quick diagnostic — test basic Ollama chat without tools."""
 import asyncio
+
 import httpx
+
 
 async def test():
     async with httpx.AsyncClient(base_url="http://localhost:11434", timeout=120) as c:

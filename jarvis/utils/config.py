@@ -13,7 +13,6 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-
 # ──────────────────────────────────────────────
 # Pydantic config models (type-safe + validated)
 # ──────────────────────────────────────────────
@@ -25,6 +24,7 @@ class SystemConfig(BaseModel):
     log_level: str = "INFO"
     log_dir: str = "~/.jarvis/logs"
     data_dir: str = "~/.jarvis"
+    latency_report: bool = True  # Log per-turn timing breakdown (record/STT/LLM/TTS)
 
 
 class STTConfig(BaseModel):
@@ -47,6 +47,7 @@ class VoiceConfig(BaseModel):
     sensitivity: float = 0.5
     input_device: int | None = None
     output_device: int | None = None
+    barge_in: bool = True  # Let the user interrupt TTS playback by speaking
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
 
@@ -96,14 +97,6 @@ class SecurityConfig(BaseModel):
     ])
 
 
-class ServerConfig(BaseModel):
-    host: str = "127.0.0.1"
-    port: int = 8000
-    cors_origins: list[str] = Field(default_factory=lambda: [
-        "http://localhost:3000",
-    ])
-
-
 class JarvisConfig(BaseModel):
     """Root configuration object for JARVIS."""
     system: SystemConfig = Field(default_factory=SystemConfig)
@@ -111,7 +104,6 @@ class JarvisConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
-    server: ServerConfig = Field(default_factory=ServerConfig)
 
 
 # ──────────────────────────────────────────────
@@ -159,7 +151,7 @@ def load_config(config_path: str | Path | None = None) -> JarvisConfig:
         path = _find_config_file()
 
     if path and path.exists():
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
         return JarvisConfig.model_validate(raw)
 

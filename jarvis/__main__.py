@@ -1,8 +1,17 @@
 """JARVIS entry point — python -m jarvis"""
 
-# ── Suppress ALL noisy library warnings BEFORE any imports ──
+# ── Fix Windows console Unicode encoding BEFORE any imports ──
 import os
 import sys
+
+if sys.platform == "win32":
+    # Force UTF-8 for stdout/stderr to prevent charmap codec errors with emojis
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+
+# ── Suppress ALL noisy library warnings BEFORE any imports ──
 
 # Set env vars FIRST - before any imports
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -14,6 +23,7 @@ if not sys.warnoptions:
 
 # NOW suppress warnings and logging
 import warnings
+
 warnings.simplefilter("ignore")
 
 import logging
@@ -30,9 +40,9 @@ import argparse
 import asyncio
 import sys
 
-from jarvis.utils.logger import get_logger
-from jarvis.utils.config import load_config
 from jarvis.core.orchestrator import Orchestrator
+from jarvis.utils.config import load_config
+from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -56,7 +66,13 @@ async def main() -> None:
     logger.info("✅ Configuration loaded")
 
     orchestrator = Orchestrator(config)
-    await orchestrator.startup()
+    try:
+        await orchestrator.startup()
+    except RuntimeError as e:
+        # Preflight failures (Ollama down, model not pulled, ...) — fail fast
+        # with an actionable message instead of booting into broken turns.
+        logger.error("❌ Startup preflight failed: %s", e)
+        sys.exit(1)
 
     try:
         await orchestrator.run()
@@ -67,8 +83,13 @@ async def main() -> None:
         logger.info("👋 JARVIS stopped. Goodbye!")
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Console-script entry point (``jarvis`` command)."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
+
+
+if __name__ == "__main__":
+    cli()

@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from jarvis.utils.logger import get_logger
 from jarvis.utils.config import expand_path
+from jarvis.utils.logger import get_logger
 
 if TYPE_CHECKING:
-    from jarvis.utils.config import MemoryConfig, LLMConfig
+    from jarvis.utils.config import LLMConfig, MemoryConfig
 
 logger = get_logger(__name__)
 
@@ -43,6 +43,11 @@ class MemoryManager:
             return
 
         try:
+            # Mem0 phones home anonymized telemetry by default — disable it
+            # to keep the "nothing leaves this machine" guarantee.
+            import os
+            os.environ.setdefault("MEM0_TELEMETRY", "false")
+
             from mem0 import Memory
 
             vector_path = str(expand_path(self._config.vector_store.path))

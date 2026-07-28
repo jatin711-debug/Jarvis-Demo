@@ -1,10 +1,16 @@
 # JARVIS - Final Project Scope with Mem0.ai Integration
 
+> **⚠️ Historical planning document (v2.0).** This was the original scope spec.
+> The implementation has since pivoted (no FastAPI/Celery/Redis/LangChain,
+> OpenWakeWord instead of Porcupine, Kokoro/Piper instead of XTTS, Qwen models
+> instead of Llama 3.1). **See `README.md` for the current architecture and stack.**
+
 ## 🎯 **Mission Statement**
 
 Build a voice-enabled AI assistant that operates **100% locally** on user hardware, leveraging efficient local model runtimes (Ollama) and Mem0.ai for intelligent memory management to provide natural speech interaction, intelligent reasoning, and system control without any cloud dependencies or third-party API costs.
 
 ---
+
 
 ## 📋 **Project Scope - In Scope**
 

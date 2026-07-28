@@ -13,11 +13,16 @@ from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
 
+# Force UTF-8 on Windows to prevent charmap codec errors with emojis
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 _CONFIGURED = False
 _LOG_FORMAT = "%(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 
-console = Console()
+console = Console(force_terminal=True, legacy_windows=False)
 
 
 def setup_logging(

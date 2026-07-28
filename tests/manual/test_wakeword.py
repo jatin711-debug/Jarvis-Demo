@@ -1,6 +1,7 @@
 """Test OpenWakeWord engine with ONNX inference."""
 import asyncio
 import sys
+
 sys.path.insert(0, ".")
 
 from jarvis.utils.config import load_config
@@ -9,23 +10,23 @@ from jarvis.utils.config import load_config
 async def test_wakeword():
     config = load_config()
     target_ww = config.voice.wake_word  # default: 'hey_jarvis'
-    
+
     print(f"1. Initializing OpenWakeWord for '{target_ww}'...")
-    
+
     try:
-        from openwakeword.model import Model
         import pyaudio
+        from openwakeword.model import Model
     except ImportError as e:
         print(f"❌ Missing dependency: {e}")
         return
-        
+
     try:
         # Use ONNX inference — works natively on Windows without tflite-runtime
         owwModel = Model(
             wakeword_models=[target_ww],
             inference_framework="onnx"
         )
-        print(f"✅ OpenWakeWord model loaded successfully (ONNX).")
+        print("✅ OpenWakeWord model loaded successfully (ONNX).")
         print(f"   Loaded models: {list(owwModel.models.keys())}")
     except Exception as e:
         print(f"❌ Failed to load OpenWakeWord model: {e}")

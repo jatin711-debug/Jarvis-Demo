@@ -12,3 +12,8 @@ build/
 *.mp3
 .pytest_cache/
 .mypy_cache/
+
+# Local llama.cpp runtime experiment (binaries + GGUF models, large)
+tools/
+# Benchmark artifacts
+bench_prompt.txt

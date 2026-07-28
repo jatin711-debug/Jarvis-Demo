@@ -1,7 +1,8 @@
 """Test Qwen3 with thinking disabled."""
 import asyncio
-import json
+
 import httpx
+
 
 async def test(name: str, payload: dict):
     print(f"\n=== {name} ===")

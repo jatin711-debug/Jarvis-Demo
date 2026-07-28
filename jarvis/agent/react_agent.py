@@ -1,29 +1,39 @@
 """
 JARVIS ReAct Agent
 ===================
-Prompt-based Reasoning + Acting loop that works with ANY LLM model.
-Uses structured JSON output parsing instead of native tool calling API.
+Reasoning + Acting loop with two tool-calling paths:
+
+1. NATIVE (preferred): Ollama's tool-calling API — reliable, structured.
+2. FALLBACK: text parsing (<|tool_call_start|>[fn(args)] / JSON blocks) for
+   models/providers without native support (auto-detected, e.g. HuggingFace).
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import re
-from typing import Any, AsyncIterator, TYPE_CHECKING
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from jarvis.agent.llm_client import LLMClient
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.logger import get_logger
 
 if TYPE_CHECKING:
-    from jarvis.utils.config import LLMConfig
+    pass
 
 logger = get_logger(__name__)
 
 # Maximum tool-calling iterations to prevent infinite loops
-MAX_ITERATIONS = 5
+MAX_ITERATIONS = 8
+
+# Retries for transient LLM failures / empty responses
+_MAX_LLM_RETRIES = 2
 
 # Keywords that trigger vision (screenshot analysis)
 _VISION_KEYWORDS = re.compile(
@@ -35,10 +45,11 @@ _VISION_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# System prompt addition that teaches the LLM how to use tools
+# Fallback tool-call format instructions — only used when native tool
+# calling is unavailable (HuggingFace provider or unsupported models).
 TOOL_PROMPT_TEMPLATE = """
 You have tools. To call one, use ONLY this format:
-<|tool_call_start|>[open_app(app_name="notepad")]<|tool_call_end|>
+<|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
 
 If no tool is needed, reply with plain text.
 
@@ -64,6 +75,9 @@ _ACTION_CLAIM_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Markers that may begin an inline (fallback) tool call in streamed text
+_STREAM_MARKERS = ("<|", "```json", '{"tool"')
+
 
 def _build_tool_descriptions(registry: ToolRegistry) -> str:
     """Build compact tool descriptions to minimize prompt tokens."""
@@ -88,64 +102,100 @@ _LFM_TOOL_CALL_START = "<|tool_call_start|>"
 _LFM_TOOL_CALL_END = "<|tool_call_end|>"
 
 
+def _parse_func_call(call_text: str) -> dict[str, Any] | None:
+    """
+    Parse a Python-style function call: tool_name(arg="value", arg2=123).
+    Positional arguments are returned under "_positional" for the caller
+    to map onto the tool's declared parameter order.
+    """
+    func_match = re.match(r"(\w+)\((.*)\)", call_text.strip(), re.DOTALL)
+    if not func_match:
+        return None
+    tool_name = func_match.group(1)
+    args_str = func_match.group(2).strip()
+    args: dict[str, Any] = {}
+    positional: list[Any] = []
+
+    def _convert(val: str) -> Any:
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            # Unescape \" and \\ inside double-quoted strings
+            return val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        if val.startswith("'") and val.endswith("'") and len(val) >= 2:
+            return val[1:-1].replace("\\'", "'")
+        low = val.lower()
+        if low in ("true",):
+            return True
+        if low in ("false",):
+            return False
+        if low in ("null", "none"):
+            return None
+        try:
+            return float(val) if "." in val else int(val)
+        except ValueError:
+            return val
+
+    # Named args: key="value" / key='value' / key=123 / key=true
+    named_pattern = (
+        r'(\w+)=(?:("(?:[^"\\]|\\.)*")|(\'(?:[^\'\\]|\\.)*\')|'
+        r'(-?\d+\.?\d*)|(true|false|True|False|NULL|null|None))'
+    )
+    named_spans: list[tuple[int, int]] = []
+    for m in re.finditer(named_pattern, args_str):
+        key = m.group(1)
+        raw = next(g for g in m.groups()[1:] if g is not None)
+        args[key] = _convert(raw)
+        named_spans.append(m.span())
+
+    # Anything not consumed by a named arg may be a positional value
+    remainder = args_str
+    for start, end in reversed(named_spans):
+        remainder = remainder[:start] + remainder[end:]
+    for piece in remainder.split(","):
+        piece = piece.strip()
+        if piece:
+            positional.append(_convert(piece))
+
+    result: dict[str, Any] = {"tool": tool_name, "args": args}
+    if positional:
+        result["_positional"] = positional
+    return result
+
+
 def _parse_tool_call(text: str) -> dict[str, Any] | None:
     """
     Try to extract a tool call from the LLM response.
-    Handles various formats: raw JSON, markdown code blocks, LFM format,
-    and common LLM variations (missing brackets, partial tokens, etc.).
-
-    LFM format: <|tool_call_start|>[tool_name(arg="value")]<|tool_call_end|>
+    Handles: LFM markers, JSON blocks, raw JSON variants, and
+    Python-style function calls.
     """
     def _clean(parsed: dict) -> dict:
-        # Strip trailing () from tool name (LLM sometimes copies from description)
         parsed["tool"] = re.sub(r"\(.*\)$", "", parsed["tool"]).strip()
         return parsed
 
-    def _parse_func_call(call_text: str) -> dict[str, Any] | None:
-        """Parse a Python-style function call: tool_name(arg=\"value\", arg2=123)"""
-        func_match = re.match(r"(\w+)\((.*)\)", call_text, re.DOTALL)
-        if not func_match:
-            return None
-        tool_name = func_match.group(1)
-        args_str = func_match.group(2)
-        args = {}
-        # Parse arguments: key="value" or key='value' or key=123 or key=true/false
-        arg_pattern = r'(\w+)=(?:("(?:[^"\\]|\\.)*")|(\'(?:[^\'\\]|\\.)*\')|(\d+\.?\d*)|(true|false|True|False|NULL|null|None))'
-        for m in re.finditer(arg_pattern, args_str):
-            key = m.group(1)
-            val = m.group(2) or m.group(3) or m.group(4) or m.group(5)
-            if val is None:
-                continue
-            # Strip quotes from string values
-            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            # Convert number strings to actual numbers
-            try:
-                if '.' in str(val):
-                    val = float(val)
-                else:
-                    val = int(val)
-            except (ValueError, TypeError):
-                pass
-            # Convert booleans/nulls
-            if isinstance(val, str):
-                lower = val.lower()
-                if lower in ("true", "True"):
-                    val = True
-                elif lower in ("false", "False"):
-                    val = False
-                elif lower in ("null", "none", "NULL", "None"):
-                    val = None
-            args[key] = val
-        return {"tool": tool_name, "args": args}
+    def _from_json(parsed: dict) -> dict | None:
+        """Accept {"tool":...,"args":...}, {"name":...,"arguments":...},
+        and native {"function": {...}} shapes."""
+        if "tool" in parsed:
+            return _clean(parsed)
+        if "name" in parsed:
+            return _clean({
+                "tool": parsed["name"],
+                "args": parsed.get("arguments", parsed.get("args", {})),
+            })
+        fn = parsed.get("function")
+        if isinstance(fn, dict) and "name" in fn:
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            return _clean({"tool": fn["name"], "args": args})
+        return None
 
     # ── LFM format (flexible) ──
-    # Try exact tokens first, then looser variants
     lfm_variants = [
-        # Exact with square brackets
-        (re.escape(_LFM_TOOL_CALL_START) + r"\[(.*?)\]" + re.escape(_LFM_TOOL_CALL_END)),
-        # Without square brackets
-        (re.escape(_LFM_TOOL_CALL_START) + r"(.*?)" + re.escape(_LFM_TOOL_CALL_END)),
+        re.escape(_LFM_TOOL_CALL_START) + r"\[(.*?)\]" + re.escape(_LFM_TOOL_CALL_END),
+        re.escape(_LFM_TOOL_CALL_START) + r"(.*?)" + re.escape(_LFM_TOOL_CALL_END),
     ]
     for pattern in lfm_variants:
         match = re.search(pattern, text, re.DOTALL)
@@ -157,7 +207,6 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
 
     # ── Loose heuristic: any func(args) near tool call markers ──
     if "tool_call" in text.lower():
-        # Look for tool_name(args) anywhere in the text
         func_match = re.search(r"(\w+)\((.*?)\)", text, re.DOTALL)
         if func_match:
             parsed = _parse_func_call(func_match.group(0))
@@ -168,14 +217,14 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
     code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if code_block:
         try:
-            parsed = json.loads(code_block.group(1))
-            if "tool" in parsed:
-                return _clean(parsed)
+            parsed = _from_json(json.loads(code_block.group(1)))
+            if parsed:
+                return parsed
         except json.JSONDecodeError:
             pass
 
-    # ── Raw JSON with tool key ──
-    json_match = re.search(r'\{\s*"tool"\s*:', text)
+    # ── Raw JSON with a tool-ish key ──
+    json_match = re.search(r'\{\s*"(?:tool|name|function)"\s*:', text)
     if json_match:
         start = json_match.start()
         brace_count = 0
@@ -186,9 +235,9 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
                 brace_count -= 1
                 if brace_count == 0:
                     try:
-                        parsed = json.loads(text[start:i + 1])
-                        if "tool" in parsed:
-                            return _clean(parsed)
+                        parsed = _from_json(json.loads(text[start:i + 1]))
+                        if parsed:
+                            return parsed
                     except json.JSONDecodeError:
                         pass
                     break
@@ -196,18 +245,28 @@ def _parse_tool_call(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_native_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize Ollama native tool_calls → [{tool, args}, ...]."""
+    normalized = []
+    for call in tool_calls:
+        fn = call.get("function", {})
+        name = fn.get("name", "")
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if name:
+            normalized.append({"tool": name, "args": args})
+    return normalized
+
+
 class ReActAgent:
     """
-    A prompt-based ReAct (Reasoning + Acting) agent.
-
-    Works with ANY model — no native tool calling API required.
-    The LLM is taught to output structured JSON when it wants to use a tool.
-
-    Loop:
-    1. Send user message with tool descriptions in system prompt
-    2. If LLM responds with tool-call JSON → execute it, feed results back
-    3. Repeat until LLM responds with plain text (final answer)
-    4. Return the final response
+    ReAct agent with native tool calling (preferred) and a text-parsing
+    fallback. `run()` collects the full response; `run_stream()` streams
+    the final answer token-by-token as it is generated (true streaming).
     """
 
     # Keywords that signal the user wants browser/web tools
@@ -229,11 +288,13 @@ class ReActAgent:
         self.tools = tools
         self._browser_tools = browser_tools
         self._base_system_prompt = system_prompt
-        # Pre-build descriptions for each set
+        # Pre-build descriptions for the fallback (text-prompt) path
         self._system_tool_desc = _build_tool_descriptions(tools)
         self._browser_tool_desc = (
             _build_tool_descriptions(browser_tools) if browser_tools else ""
         )
+        # None = native tool support unknown (optimistic), False = disabled
+        self._native_tools_ok: bool | None = (llm.provider == "ollama") or None
 
     def _needs_browser_tools(self, text: str) -> bool:
         """Check if the user message implies web/browser usage."""
@@ -244,6 +305,13 @@ class ReActAgent:
         if include_browser and self._browser_tool_desc:
             return self._system_tool_desc + "\n" + self._browser_tool_desc
         return self._system_tool_desc
+
+    def _get_ollama_tools(self, include_browser: bool) -> list[dict[str, Any]]:
+        """Native tool schemas for the active tool set."""
+        schemas = self.tools.get_ollama_tools()
+        if include_browser and self._browser_tools:
+            schemas += self._browser_tools.get_ollama_tools()
+        return schemas
 
     def _resolve_tool(self, name: str):
         """Look up a tool in system tools first, then browser tools."""
@@ -260,17 +328,21 @@ class ReActAgent:
             return await self._browser_tools.execute(name, **kwargs)
         raise ValueError(f"Unknown tool: {name}")
 
-    def _build_system_prompt(self, context: list[str] | None = None,
-                              include_browser: bool = False) -> str:
+    def _build_system_prompt(
+        self,
+        context: list[str] | None = None,
+        include_browser: bool = False,
+        use_native: bool = True,
+    ) -> str:
         """Build the full system prompt with tools and context."""
         prompt = self._base_system_prompt
 
-        # Add tool instructions
-        tool_desc = self._get_tool_descriptions(include_browser)
-        if tool_desc:
-            prompt += TOOL_PROMPT_TEMPLATE.format(
-                tool_descriptions=tool_desc,
-            )
+        # Fallback path needs inline format instructions; native path
+        # gets tool schemas via the API and needs no extra tokens.
+        if not use_native:
+            tool_desc = self._get_tool_descriptions(include_browser)
+            if tool_desc:
+                prompt += TOOL_PROMPT_TEMPLATE.format(tool_descriptions=tool_desc)
 
         # Add memory context
         if context:
@@ -280,12 +352,14 @@ class ReActAgent:
         return prompt
 
     async def _capture_screenshot(self) -> list[str] | None:
-        """Capture the screen and return as base64-encoded PNG."""
+        """Capture the screen, downsize for vision model, and return as base64-encoded PNG."""
         try:
             import pyautogui
             img = pyautogui.screenshot()
+            # Downsize to reduce vision encoder latency (~60-70% smaller payload)
+            img = img.resize((672, 448))
             buf = io.BytesIO()
-            img.save(buf, format="PNG")
+            img.save(buf, format="PNG", optimize=True)
             b64 = base64.b64encode(buf.getvalue()).decode()
             logger.debug("Screenshot captured: %d bytes base64", len(b64))
             return [b64]
@@ -297,56 +371,69 @@ class ReActAgent:
         """Check if the user message implies visual context is needed."""
         return bool(_VISION_KEYWORDS.search(text))
 
-    async def run(
+    def _map_positional_args(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Map positional args onto the tool's declared parameter order."""
+        positional = tool_call.pop("_positional", None)
+        if not positional:
+            return tool_call
+        tool_def = self._resolve_tool(tool_call.get("tool", ""))
+        if tool_def is None:
+            return tool_call
+        declared = list(tool_def.parameters.get("properties", {}).keys())
+        for i, value in enumerate(positional):
+            if i < len(declared) and declared[i] not in tool_call["args"]:
+                tool_call["args"][declared[i]] = value
+        return tool_call
+
+    async def _chat_with_retry(self, messages, tools, images):
+        """Non-streamed chat with retries for transient failures."""
+        for attempt in range(_MAX_LLM_RETRIES + 1):
+            try:
+                return await self.llm.chat(messages=messages, tools=tools, images=images)
+            except (TimeoutError, httpx.HTTPError) as e:
+                if attempt >= _MAX_LLM_RETRIES:
+                    raise
+                wait = 0.5 * (attempt + 1)
+                logger.warning("LLM request failed (%s), retrying in %.1fs", e, wait)
+                await asyncio.sleep(wait)
+        raise RuntimeError("unreachable")
+
+    async def _run_impl(
         self,
         user_message: str,
-        conversation_history: list[dict[str, str]] | None = None,
-        context: list[str] | None = None,
-    ) -> str:
+        conversation_history: list[dict[str, str]] | None,
+        context: list[str] | None,
+        stream: bool,
+    ) -> AsyncIterator[str]:
         """
-        Process a user message through the ReAct loop.
-
-        Args:
-            user_message: The user's input text
-            conversation_history: Prior messages for context
-            context: Relevant memories from Mem0
-
-        Returns:
-            The agent's final text response
+        Core ReAct loop. Yields response tokens (all at once when
+        stream=False, incrementally when stream=True).
         """
-        # Build messages
-        messages: list[dict[str, Any]] = []
-
-        # Detect if browser tools are needed
+        # ── Build messages ──
         include_browser = self._needs_browser_tools(user_message)
         if include_browser:
             logger.debug("Browser tools activated for this request")
 
-        # Detect if vision is needed
         images: list[str] | None = None
         if self._needs_vision(user_message):
             logger.info("Vision triggered for: %s", user_message[:80])
             images = await self._capture_screenshot()
-            if images:
-                logger.info("Screenshot attached to LLM request")
 
-        # System prompt with tools + context
-        system_prompt = self._build_system_prompt(context, include_browser=include_browser)
+        use_native = self._native_tools_ok is True
+        system_prompt = self._build_system_prompt(
+            context, include_browser=include_browser, use_native=use_native,
+        )
         if images:
             system_prompt += (
                 "\n\nVISION MODE: A screenshot is attached to the user's message. "
                 "Describe or analyze what you see in the image directly. "
                 "Do NOT call tools to capture or analyze the image — it is already provided."
             )
-        messages.append({"role": "system", "content": system_prompt})
 
-        # Conversation history
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if conversation_history:
             messages.extend(conversation_history)
-
-        # Current user message
         if images:
-            # Tell the model to analyze the attached image directly
             messages.append({
                 "role": "user",
                 "content": f"{user_message}\n\n[I've attached a screenshot. Answer based on what you see in the image.]",
@@ -354,102 +441,221 @@ class ReActAgent:
         else:
             messages.append({"role": "user", "content": user_message})
 
-        # ReAct loop
-        self._last_tool_call = None  # reset dedup tracker per run
-        self._seen_tool_calls: set[tuple[str, str]] = set()  # ALL calls made this run
-        tool_was_called = False  # track if any tool was called this run
+        native_tools = self._get_ollama_tools(include_browser) if use_native else None
+
+        seen_tool_calls: set[tuple[str, str]] = set()
+        tool_was_called = False
+        claim_retries = 0
+        empty_retries = 0
+        content = ""
+
         for iteration in range(MAX_ITERATIONS):
             logger.debug("ReAct iteration %d/%d", iteration + 1, MAX_ITERATIONS)
 
-            response = await self.llm.chat(messages=messages, images=images if iteration == 0 else None)
-            content = response.get("message", {}).get("content", "")
-            thinking = response.get("message", {}).get("thinking", "")
-            logger.info("🧠 LLM raw (iter %d): %s", iteration + 1, content[:300])
-            if thinking:
-                logger.debug("🧠 LLM thinking (iter %d): %s", iteration + 1, thinking[:300])
+            # ── Get LLM response (streamed or one-shot) ──
+            tool_calls_raw: list[dict[str, Any]] = []
+            try:
+                if stream:
+                    # True streaming: tokens flow to the caller as they
+                    # arrive; text that could be a fallback tool call is
+                    # held back so markup is never spoken.
+                    flushed: list[str] = []
+                    pending = ""
+                    suspicious = False
+                    done_event: dict[str, Any] | None = None
+                    async for event in self.llm.chat_stream_events(
+                        messages=messages,
+                        tools=native_tools,
+                        images=images if iteration == 0 else None,
+                    ):
+                        if event["type"] == "done":
+                            done_event = event
+                            break
+                        token = event["text"]
+                        pending += token
+                        if suspicious:
+                            continue
+                        cut = -1
+                        for marker in _STREAM_MARKERS:
+                            idx = pending.find(marker)
+                            if idx != -1:
+                                cut = idx if cut == -1 else min(cut, idx)
+                        if cut != -1:
+                            if cut > 0:
+                                flushed.append(pending[:cut])
+                                yield pending[:cut]
+                            pending = pending[cut:]
+                            suspicious = True
+                        elif len(pending) > 2:
+                            # Flush all but a 2-char tail (split markers)
+                            flushed.append(pending[:-2])
+                            yield pending[:-2]
+                            pending = pending[-2:]
+                    if done_event is not None:
+                        tool_calls_raw = done_event.get("tool_calls", [])
+                    content = "".join(flushed) + pending
+                    # Held-back text that isn't a tool call is innocent — flush it
+                    if pending and not tool_calls_raw and not _parse_tool_call(content):
+                        yield pending
+                else:
+                    response = await self._chat_with_retry(
+                        messages, native_tools, images if iteration == 0 else None,
+                    )
+                    msg = response.get("message", {})
+                    content = msg.get("content", "")
+                    tool_calls_raw = msg.get("tool_calls", [])
+            except httpx.HTTPStatusError as e:
+                body = ""
+                try:
+                    body = e.response.text[:300]
+                except Exception:
+                    pass
+                if e.response.status_code == 400 and "tool" in body.lower():
+                    # Model doesn't support native tool calling — fall back
+                    logger.warning("Native tools unsupported, switching to text parsing")
+                    self._native_tools_ok = False
+                    native_tools = None
+                    messages[0]["content"] = self._build_system_prompt(
+                        context, include_browser=include_browser, use_native=False,
+                    )
+                    continue
+                raise
 
-            if not content:
-                logger.warning("⚠️ Empty LLM response (iter %d). Prompt had %d chars, %d messages. Thinking length: %d chars",
-                               iteration + 1, len(self._build_system_prompt(context, include_browser=include_browser)), len(messages), len(thinking))
-                return "I couldn't generate a response."
+            logger.info("LLM raw (iter %d): %s", iteration + 1, content[:300])
 
-            # Strip <think>...</think> tags for parsing (but keep for context)
-            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            # ── Handle empty responses with a retry ──
+            if not content and not tool_calls_raw:
+                empty_retries += 1
+                if empty_retries <= _MAX_LLM_RETRIES:
+                    logger.warning("Empty LLM response (iter %d), retrying", iteration + 1)
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning("Empty LLM response after retries")
+                yield "I couldn't generate a response."
+                return
 
-            # Try to parse a tool call from the response
-            tool_call = _parse_tool_call(content) or _parse_tool_call(cleaned)
+            # ── Resolve tool call(s): native first, fallback parse second ──
+            parsed_calls: list[dict[str, Any]] = []
+            native_call = False
+            if tool_calls_raw:
+                parsed_calls = _normalize_native_calls(tool_calls_raw)
+                native_call = True
+            else:
+                cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                fallback = _parse_tool_call(content) or _parse_tool_call(cleaned)
+                if fallback:
+                    parsed_calls = [self._map_positional_args(fallback)]
 
-            if tool_call is None:
-                # No tool call — but check if model is CLAIMING it did something
-                # without actually calling a tool (hallucinated action)
-                if not tool_was_called and _ACTION_CLAIM_PATTERNS.search(cleaned):
-                    logger.warning("⚠️ Model claimed action without tool call, forcing retry")
+            # ── Final answer? ──
+            if not parsed_calls:
+                cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                if not tool_was_called and claim_retries < 1 and \
+                        _ACTION_CLAIM_PATTERNS.search(cleaned):
+                    claim_retries += 1
+                    logger.warning("Model claimed action without tool call, forcing retry")
                     messages.append({"role": "assistant", "content": content})
+                    if native_tools is not None:
+                        nudge = (
+                            "You said you did something but you did NOT call any tool. "
+                            "You MUST use one of the provided tools to perform actions. "
+                            "Actually call the tool now."
+                        )
+                    else:
+                        nudge = (
+                            "You said you did something but you did NOT call any tool. "
+                            "You MUST use a tool to perform actions. Reply with ONLY the "
+                            "tool call in the format <|tool_call_start|>[tool_name(arg=\"value\")]<|tool_call_end|>."
+                        )
+                    messages.append({"role": "user", "content": nudge})
+                    continue
+
+                final = cleaned if cleaned else content
+                if not stream:
+                    yield final
+                return
+
+            # ── Execute tool call(s) ──
+            if native_call:
+                messages.append({
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls_raw,
+                })
+            else:
+                messages.append({"role": "assistant", "content": content})
+
+            for tool_call in parsed_calls:
+                tool_name = tool_call.get("tool", "")
+                tool_args = tool_call.get("args", {})
+
+                # Dedup: same tool+args already executed this run
+                call_key = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+                if call_key in seen_tool_calls:
+                    logger.warning("Skipping repeated tool call: %s", tool_name)
+                    dup_msg = (
+                        f"You already called '{tool_name}' with these exact arguments. "
+                        "Do NOT repeat it. Either use a DIFFERENT tool, or give your "
+                        "final text response now."
+                    )
+                    if native_call:
+                        messages.append({"role": "tool", "name": tool_name, "content": dup_msg})
+                    else:
+                        messages.append({"role": "user", "content": dup_msg})
+                    continue
+                seen_tool_calls.add(call_key)
+
+                logger.info("Agent calling tool: %s(%s)", tool_name, tool_args)
+                tool_was_called = True
+
+                try:
+                    result = await self._execute_tool(tool_name, **tool_args)
+                    result_str = str(result)
+                except ValueError:
+                    result_str = (
+                        f"Error: Unknown tool '{tool_name}'. "
+                        f"Available: {self.tools.list_tools()}"
+                    )
+                    logger.warning("Unknown tool: %s", tool_name)
+                except Exception as e:
+                    result_str = f"Error executing {tool_name}: {e}"
+                    logger.error("Tool '%s' failed: %s", tool_name, e)
+
+                if native_call:
+                    messages.append({
+                        "role": "tool", "name": tool_name, "content": result_str,
+                    })
+                else:
                     messages.append({
                         "role": "user",
                         "content": (
-                            "You said you did something but you did NOT call any tool. "
-                            "You MUST use a tool to perform actions. Reply with ONLY the "
-                            "JSON tool call to actually do what the user asked."
+                            f"Tool '{tool_name}' returned:\n{result_str}\n\n"
+                            "If the user's request is fully completed, give a brief final "
+                            "response. If more steps are needed, call the next tool."
                         ),
                     })
-                    continue
 
-                # Genuine final answer
-                final = cleaned if cleaned else content
-                return final
-
-            # Execute the tool
-            tool_name = tool_call.get("tool", "")
-            tool_args = tool_call.get("args", {})
-
-            # Prevent repeated tool calls (same tool+args seen ANY time this run)
-            call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
-            if call_key in self._seen_tool_calls:
-                logger.warning("⚠️ Skipping repeated tool call: %s (already executed this run)", tool_name)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"You already called '{tool_name}' with these exact arguments earlier. "
-                        f"Do NOT repeat it. Either use a DIFFERENT tool to continue the task, "
-                        f"or give your final text response to the user now."
-                    ),
-                })
-                continue
-            self._seen_tool_calls.add(call_key)
-
-            logger.info("🔧 Agent calling tool: %s(%s)", tool_name, tool_args)
-            tool_was_called = True
-
-            # Add the assistant's tool-calling message
-            messages.append({"role": "assistant", "content": content})
-
-            try:
-                result = await self._execute_tool(tool_name, **tool_args)
-                result_str = str(result)
-            except ValueError as e:
-                result_str = f"Error: Unknown tool '{tool_name}'. Available: {self.tools.list_tools()}"
-                logger.warning("Unknown tool: %s", tool_name)
-            except Exception as e:
-                result_str = f"Error executing {tool_name}: {e}"
-                logger.error("Tool '%s' failed: %s", tool_name, e)
-
-            # Feed tool result back — allow further tool calls if multi-step
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Tool '{tool_name}' returned:\n{result_str}\n\n"
-                    f"If the user's request is fully completed, give a brief final response. "
-                    f"If more steps are needed, call the next tool."
-                ),
-            })
-
-        # Exhausted iterations — give a summary of what was done
+        # ── Exhausted iterations ──
         logger.warning("ReAct loop exhausted %d iterations", MAX_ITERATIONS)
-        if tool_was_called:
-            return "I've completed what I could. Let me know if you need anything else."
-        return content if content else "I ran into too many steps. Please try again."
+        closing = (
+            "I've completed what I could. Let me know if you need anything else."
+            if tool_was_called
+            else (content if content else "I ran into too many steps. Please try again.")
+        )
+        yield closing
+
+    async def run(
+        self,
+        user_message: str,
+        conversation_history: list[dict[str, str]] | None = None,
+        context: list[str] | None = None,
+    ) -> str:
+        """Process a user message through the ReAct loop. Returns the response."""
+        parts: list[str] = []
+        async for token in self._run_impl(
+            user_message, conversation_history, context, stream=False,
+        ):
+            parts.append(token)
+        return "".join(parts)
 
     async def run_stream(
         self,
@@ -458,116 +664,13 @@ class ReActAgent:
         context: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """
-        Same as run(), but streams the FINAL answer token-by-token.
-
-        Tool-call iterations are done internally (non-streamed).
-        Once the agent is ready to give its final answer, the last
-        iteration is streamed via LLM chat_stream().
-
-        Yields individual tokens as they arrive.
+        Same as run(), but streams the answer token-by-token as it is
+        generated — including the final answer after any tool calls.
         """
-        # Build messages (same as run())
-        messages: list[dict[str, Any]] = []
-        include_browser = self._needs_browser_tools(user_message)
-        if include_browser:
-            logger.debug("🌐 Browser tools activated for this request (stream)")
-        system_prompt = self._build_system_prompt(context, include_browser=include_browser)
-        messages.append({"role": "system", "content": system_prompt})
-        if conversation_history:
-            messages.extend(conversation_history)
-        messages.append({"role": "user", "content": user_message})
-
-        self._last_tool_call = None
-        self._seen_tool_calls: set[tuple[str, str]] = set()
-        tool_was_called = False
-
-        for iteration in range(MAX_ITERATIONS):
-            logger.debug("ReAct-stream iteration %d/%d", iteration + 1, MAX_ITERATIONS)
-
-            # Non-final iterations: use regular (non-streamed) chat
-            response = await self.llm.chat(messages=messages)
-            content = response.get("message", {}).get("content", "")
-            thinking = response.get("message", {}).get("thinking", "")
-            logger.info("🧠 LLM raw (iter %d): %s", iteration + 1, content[:300])
-            if thinking:
-                logger.debug("🧠 LLM thinking (iter %d): %s", iteration + 1, thinking[:300])
-
-            if not content:
-                logger.warning("⚠️ Empty LLM response (stream iter %d). Prompt had %d messages. Thinking length: %d chars",
-                               iteration + 1, len(messages), len(thinking))
-                yield "I couldn't generate a response."
-                return
-
-            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-            tool_call = _parse_tool_call(content) or _parse_tool_call(cleaned)
-
-            if tool_call is None:
-                # Check hallucination
-                if not tool_was_called and _ACTION_CLAIM_PATTERNS.search(cleaned):
-                    logger.warning("⚠️ Model claimed action without tool call, forcing retry")
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "You said you did something but you did NOT call any tool. "
-                            "You MUST use a tool to perform actions. Reply with ONLY the "
-                            "JSON tool call to actually do what the user asked."
-                        ),
-                    })
-                    continue
-
-                # This IS the final answer — but we already have it from the
-                # non-streamed call. Just yield it. (Streaming the final
-                # iteration adds complexity for ~100ms gain; we can refine later.)
-                final = cleaned if cleaned else content
-                yield final
-                return
-
-            # Execute tool (same as run())
-            tool_name = tool_call.get("tool", "")
-            tool_args = tool_call.get("args", {})
-            call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
-            if call_key in self._seen_tool_calls:
-                logger.warning("⚠️ Skipping repeated tool call: %s", tool_name)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"You already called '{tool_name}' with these exact arguments. "
-                        f"Do NOT repeat it. Give your final text response now."
-                    ),
-                })
-                continue
-            self._seen_tool_calls.add(call_key)
-
-            logger.info("🔧 Agent calling tool: %s(%s)", tool_name, tool_args)
-            tool_was_called = True
-            messages.append({"role": "assistant", "content": content})
-
-            try:
-                result = await self._execute_tool(tool_name, **tool_args)
-                result_str = str(result)
-            except ValueError:
-                result_str = f"Error: Unknown tool '{tool_name}'."
-            except Exception as e:
-                result_str = f"Error executing {tool_name}: {e}"
-
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Tool '{tool_name}' returned:\\n{result_str}\\n\\n"
-                    f"If the user's request is fully completed, give a brief final response. "
-                    f"If more steps are needed, call the next tool."
-                ),
-            })
-
-        # Exhausted iterations
-        logger.warning("ReAct-stream loop exhausted %d iterations", MAX_ITERATIONS)
-        if tool_was_called:
-            yield "I've completed what I could. Let me know if you need anything else."
-        else:
-            yield content if content else "I ran into too many steps. Please try again."
-
+        async for token in self._run_impl(
+            user_message, conversation_history, context, stream=True,
+        ):
+            yield token
 
     # ==========================================================================
     # AUTONOMOUS RESEARCH MODE
@@ -615,7 +718,6 @@ class ReActAgent:
 
         # Use the standard ReAct loop but with research-specific prompt
         self._seen_tool_calls: set[tuple[str, str]] = set()
-        tool_was_called = False
         sources_consulted = 0
 
         for iteration in range(MAX_ITERATIONS):
@@ -663,7 +765,6 @@ class ReActAgent:
                 continue
             self._seen_tool_calls.add(call_key)
 
-            tool_was_called = True
             messages.append({"role": "assistant", "content": content})
 
             try:
@@ -703,7 +804,9 @@ class ReActAgent:
         """
         logger.info("Computer-use mode: %s", goal[:80])
 
-        import base64, io
+        import base64
+        import io
+
         import pyautogui
 
         # ── Phase 1: Planning ──

@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import numpy as np
-from typing import AsyncIterator, TYPE_CHECKING
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
-from jarvis.voice.engines import STTEngine, TTSEngine, WakeWordEngine
+import numpy as np
+
 from jarvis.utils.logger import get_logger
+from jarvis.voice.engines import STTEngine, TTSEngine, WakeWordEngine
 
 if TYPE_CHECKING:
     from jarvis.utils.config import VoiceConfig
@@ -31,11 +33,19 @@ _TARGET_SR = 16000
 
 
 def _resample(audio_int16: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample int16 audio from orig_sr to target_sr using scipy."""
+    """Resample int16 audio from orig_sr to target_sr using soxr (fast) or scipy (fallback)."""
     if orig_sr == target_sr:
         return audio_int16
-    from scipy.signal import resample_poly
+    # Try soxr first — 5-10x faster than scipy, same quality
+    try:
+        import soxr
+        resampled = soxr.resample(audio_int16.astype(np.float32), orig_sr, target_sr)
+        return resampled.astype(np.int16)
+    except ImportError:
+        pass
     from math import gcd
+
+    from scipy.signal import resample_poly
     g = gcd(orig_sr, target_sr)
     up = target_sr // g
     down = orig_sr // g
@@ -88,6 +98,80 @@ def _validate_mic(device_index: int | None, sample_rate: int, duration: float = 
 
 
 # ──────────────────────────────────────────────
+# Gapless audio playback
+# ──────────────────────────────────────────────
+
+
+class _GaplessPlayer:
+    """
+    Persistent sounddevice output stream for TTS playback.
+
+    The old per-chunk sd.play()/sd.wait() pattern closed and reopened the
+    audio stream for every chunk and sentence — the source of audible gaps
+    and clicks, especially over Bluetooth. This keeps ONE stream open with
+    a high-latency buffer and writes chunks into it continuously.
+    """
+
+    def __init__(self, device: int | None = None) -> None:
+        self._device = device
+        self._stream = None
+        self._sr: int | None = None
+        self._written = 0.0  # seconds of audio queued since stream start
+        self._aborted = False
+
+    def play(self, audio: np.ndarray, sample_rate: int) -> None:
+        """Queue audio for playback (recreates the stream if rate changed)."""
+        import sounddevice as sd
+        if self._stream is None or self._stream.closed or sample_rate != self._sr:
+            self.close()
+            self._stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                latency="high",  # larger buffer — survives Bluetooth jitter
+                device=self._device,
+            )
+            self._stream.start()
+            self._sr = sample_rate
+            self._written = 0.0
+        self._stream.write(np.ascontiguousarray(audio, dtype=np.float32))
+        self._written += len(audio) / sample_rate
+
+    def drain(self, timeout: float = 60.0) -> None:
+        """Block until everything queued so far has actually been played."""
+        if self._stream is None or self._stream.closed:
+            return
+        import time
+        deadline = time.monotonic() + timeout
+        while (not self._aborted
+               and self._stream.time < self._written
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+
+    def reset_abort(self) -> None:
+        """Clear the aborted flag before starting a new utterance."""
+        self._aborted = False
+
+    def abort(self) -> None:
+        """Stop playback immediately (barge-in). Buffered audio is dropped."""
+        self._aborted = True
+        if self._stream is not None and not self._stream.closed:
+            try:
+                self._stream.abort()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+            self._written = 0.0
+
+
+# ──────────────────────────────────────────────
 # Kokoro TTS
 # ──────────────────────────────────────────────
 
@@ -100,6 +184,7 @@ class KokoroTTS(TTSEngine):
         self.speed = config.tts.speed
         self.sample_rate = config.tts.sample_rate
         self._pipeline = None
+        self._player = _GaplessPlayer(device=config.output_device)
 
     async def startup(self) -> None:
         loop = asyncio.get_event_loop()
@@ -117,6 +202,7 @@ class KokoroTTS(TTSEngine):
 
     async def shutdown(self) -> None:
         self._pipeline = None
+        self._player.close()
 
     async def synthesize(self, text: str) -> bytes:
         """Synthesize text → WAV bytes."""
@@ -142,19 +228,24 @@ class KokoroTTS(TTSEngine):
         return buf.getvalue()
 
     async def speak(self, text: str) -> None:
-        """Synthesize and play through speakers."""
-        import sounddevice as sd
-
+        """Synthesize and play through speakers (gapless continuous stream)."""
         loop = asyncio.get_event_loop()
+        self._player.reset_abort()
 
         def _speak():
             for _gs, _ps, audio in self._pipeline(
                 text, voice=self.voice, speed=self.speed, split_pattern=r"\n+"
             ):
-                sd.play(audio, self.sample_rate)
-                sd.wait()
+                if self._player._aborted:
+                    break
+                self._player.play(np.asarray(audio, dtype=np.float32), self.sample_rate)
+            self._player.drain()
 
         await loop.run_in_executor(None, _speak)
+
+    def abort(self) -> None:
+        """Barge-in: stop playback immediately."""
+        self._player.abort()
 
 
 # ──────────────────────────────────────────────
@@ -176,9 +267,13 @@ class PiperTTS(TTSEngine):
         )
         self._voice = None
         self.sample_rate: int = 22050  # updated from model config at startup
+        self._player = _GaplessPlayer(device=config.output_device)
 
     async def startup(self) -> None:
         from piper import PiperVoice
+
+        if not os.path.exists(self._model_path):
+            await self._download_voice_model()
 
         loop = asyncio.get_event_loop()
 
@@ -192,8 +287,66 @@ class PiperTTS(TTSEngine):
             os.path.basename(self._model_path), self.sample_rate,
         )
 
+    async def _download_voice_model(self) -> None:
+        """
+        Auto-download the Piper voice (.onnx + .onnx.json) from the
+        rhasspy/piper-voices HuggingFace repo when missing locally.
+        Model name format: <lang>_<region>-<voice>-<quality>.onnx
+        """
+        import httpx
+
+        filename = os.path.basename(self._model_path)
+        stem = filename[:-5] if filename.endswith(".onnx") else filename
+        try:
+            lang_region, voice, quality = stem.split("-")
+            lang = lang_region.split("_")[0]
+        except ValueError:
+            raise RuntimeError(
+                f"Piper voice model not found at {self._model_path} and the "
+                f"name '{filename}' doesn't follow the '<lang>_<region>-<voice>-"
+                "<quality>.onnx' convention — download it manually from "
+                "https://huggingface.co/rhasspy/piper-voices"
+            )
+
+        base = (
+            f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            f"{lang}/{lang_region}/{voice}/{quality}/{stem}"
+        )
+        os.makedirs(os.path.dirname(self._model_path), exist_ok=True)
+
+        logger.info("⬇️  Downloading Piper voice %s ...", filename)
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=httpx.Timeout(300.0, connect=15.0),
+            ) as client:
+                # (remote suffix, local path) — JSON config is "<model>.onnx.json"
+                for remote_suffix, dest in (
+                    (".onnx", self._model_path),
+                    (".onnx.json", self._model_path + ".json"),
+                ):
+                    resp = await client.get(base + remote_suffix)
+                    resp.raise_for_status()
+                    with open(dest, "wb") as f:
+                        f.write(resp.content)
+                    logger.info("   saved %s (%d bytes)", dest, len(resp.content))
+        except Exception as e:
+            # Clean up partial downloads so a retry isn't confused
+            for partial in (self._model_path, self._model_path + ".json"):
+                if os.path.exists(partial):
+                    try:
+                        os.remove(partial)
+                    except OSError:
+                        pass
+            raise RuntimeError(
+                f"Piper voice model missing and auto-download failed: {e}. "
+                f"Download '{filename}' and '{filename}.json' manually from "
+                "https://huggingface.co/rhasspy/piper-voices into "
+                f"{os.path.dirname(self._model_path)}"
+            )
+
     async def shutdown(self) -> None:
         self._voice = None
+        self._player.close()
 
     async def synthesize(self, text: str) -> bytes:
         """Synthesize text → WAV bytes."""
@@ -216,21 +369,26 @@ class PiperTTS(TTSEngine):
         return await loop.run_in_executor(None, _synth)
 
     async def speak(self, text: str) -> None:
-        """Synthesize and stream each sentence to speakers immediately."""
-        import sounddevice as sd
-
+        """Synthesize and stream to speakers (gapless continuous playback)."""
         loop = asyncio.get_event_loop()
+        self._player.reset_abort()
 
         def _speak():
             for chunk in self._voice.synthesize(text):
+                if self._player._aborted:
+                    break
                 audio = (
                     np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
                     .astype(np.float32) / 32768.0
                 )
-                sd.play(audio, self.sample_rate)
-                sd.wait()
+                self._player.play(audio, self.sample_rate)
+            self._player.drain()
 
         await loop.run_in_executor(None, _speak)
+
+    def abort(self) -> None:
+        """Barge-in: stop playback immediately."""
+        self._player.abort()
 
 
 # ──────────────────────────────────────────────
@@ -264,26 +422,33 @@ class WhisperSTT(STTEngine):
         self._model = None
 
     async def transcribe(self, audio_data: bytes) -> str:
-        """Transcribe audio bytes (WAV) → text."""
-        import tempfile
+        """Transcribe audio bytes (WAV) → text. Passes numpy array directly to faster-whisper (no temp file)."""
+        import io
+
+        import soundfile as sf
 
         loop = asyncio.get_event_loop()
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(audio_data)
-            tmp_path = tmp.name
+        # Decode WAV bytes to float32 numpy array in one shot
+        audio_np, sr = sf.read(io.BytesIO(audio_data), dtype="float32")
+
+        # Ensure mono
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=1)
+
+        # Resample to 16 kHz if needed (Whisper expects 16kHz)
+        if sr != _TARGET_SR:
+            # Scale to int16 range, resample, then normalize back to float32
+            audio_int16 = (audio_np * 32767.0).astype(np.int16)
+            audio_np = _resample(audio_int16, sr, _TARGET_SR).astype(np.float32) / 32768.0
 
         def _transcribe():
             segments, _info = self._model.transcribe(
-                tmp_path, beam_size=self.beam_size, language=self.language
+                audio_np, beam_size=self.beam_size, language=self.language
             )
             return " ".join(seg.text.strip() for seg in segments)
 
-        try:
-            text = await loop.run_in_executor(None, _transcribe)
-        finally:
-            os.unlink(tmp_path)
-
+        text = await loop.run_in_executor(None, _transcribe)
         return text
 
     async def transcribe_stream(
@@ -560,3 +725,88 @@ async def record_until_silence(
     buf = io.BytesIO()
     sf.write(buf, all_audio, sample_rate, format="WAV")
     return buf.getvalue()
+
+
+# ──────────────────────────────────────────────
+# Barge-in speech monitor
+# ──────────────────────────────────────────────
+
+
+async def wait_for_speech(
+    input_device: int | None = None,
+    sample_rate: int = 16000,
+    cancel_event: asyncio.Event | None = None,
+    threshold_factor: float = 3.0,
+    sustain_ms: int = 350,
+    max_duration: float = 180.0,
+) -> bool:
+    """
+    Monitor the microphone while TTS is playing; return True as soon as
+    sustained user speech is detected (barge-in), or False when
+    cancel_event is set (playback finished) or max_duration elapses.
+
+    The baseline is calibrated from the first ~0.5s of monitoring, which
+    already includes speaker bleed from the TTS playback — so the trigger
+    threshold sits relative to whatever the mic hears during speech output,
+    not to a silent room.
+    """
+    import pyaudio
+
+    native_sr = _get_mic_native_rate(input_device)
+    chunk_native = int(1024 * native_sr / sample_rate) if native_sr != sample_rate else 1024
+    chunk_ms = 1024 / sample_rate * 1000
+
+    loop = asyncio.get_event_loop()
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=native_sr,
+        input=True,
+        frames_per_buffer=chunk_native,
+        input_device_index=input_device,
+    )
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    try:
+        # --- Calibrate baseline (includes TTS speaker bleed) ---
+        calib_chunks = max(int(0.5 * sample_rate / 1024), 3)
+        levels: list[float] = []
+        for _ in range(calib_chunks):
+            if _cancelled():
+                return False
+            raw = await loop.run_in_executor(
+                None, lambda: stream.read(chunk_native, exception_on_overflow=False)
+            )
+            audio = _resample(np.frombuffer(raw, dtype=np.int16), native_sr, sample_rate)
+            levels.append(float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))))
+        baseline = max(float(np.mean(levels)), 1.0)
+        threshold = max(baseline * threshold_factor, 100.0)
+        logger.debug(
+            "Barge-in monitor: baseline=%.0f threshold=%.0f", baseline, threshold,
+        )
+
+        sustain_chunks = max(int(sustain_ms / chunk_ms), 1)
+        max_chunks = int(max_duration * sample_rate / 1024)
+        loud_chunks = 0
+
+        for _ in range(max_chunks):
+            if _cancelled():
+                return False
+            raw = await loop.run_in_executor(
+                None, lambda: stream.read(chunk_native, exception_on_overflow=False)
+            )
+            audio = _resample(np.frombuffer(raw, dtype=np.int16), native_sr, sample_rate)
+            rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+
+            loud_chunks = loud_chunks + 1 if rms > threshold else 0
+            if loud_chunks >= sustain_chunks:
+                logger.debug("Barge-in: sustained speech detected (rms=%.0f)", rms)
+                return True
+        return False
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
