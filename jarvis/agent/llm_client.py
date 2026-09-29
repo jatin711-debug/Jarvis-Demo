@@ -9,7 +9,9 @@ Multi-provider LLM client:
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import httpx
@@ -41,6 +43,7 @@ class LLMClient:
         self._client: httpx.AsyncClient | None = None
         self._hf_model = None
         self._hf_tokenizer = None
+        self._hf_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         """Initialize the LLM client based on provider."""
@@ -53,7 +56,7 @@ class LLMClient:
         """Initialize Ollama HTTP client and verify the configured model exists."""
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(self.config.request_timeout, connect=10.0),
         )
 
         models = await self.list_models()
@@ -107,11 +110,11 @@ class LLMClient:
             model = AutoModelForCausalLM.from_pretrained(
                 self.config.model,
                 device_map="auto",
-                torch_dtype="bfloat16",
+                dtype="auto",
             )
             tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model,
-                trust_remote_code=True,
+                trust_remote_code=False,
             )
             return model, tokenizer
 
@@ -211,7 +214,7 @@ class LLMClient:
             "stream": False,
             "keep_alive": "30m",
             "options": {
-                "temperature": temperature or self.config.temperature,
+                "temperature": self.config.temperature if temperature is None else temperature,
                 "top_p": self.config.top_p,
                 "num_predict": max_tokens or self.config.max_tokens,
                 "num_ctx": self.config.context_window,
@@ -242,35 +245,8 @@ class LLMClient:
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Chat via HuggingFace Transformers."""
-        assert self._hf_model and self._hf_tokenizer
-
-        # Apply chat template
-        prompt = self._apply_chat_template(messages)
-
-        loop = asyncio.get_event_loop()
-
-        def _generate():
-            inputs = self._hf_tokenizer(
-                prompt, return_tensors="pt"
-            ).to(self._hf_model.device)
-
-            output = self._hf_model.generate(
-                **inputs,
-                do_sample=True,
-                temperature=temperature or self.config.temperature,
-                top_p=self.config.top_p,
-                top_k=self.config.top_k,
-                repetition_penalty=self.config.repetition_penalty,
-                max_new_tokens=max_tokens or self.config.max_tokens,
-                pad_token_id=self._hf_tokenizer.pad_token_id,
-                eos_token_id=self._hf_tokenizer.eos_token_id,
-            )
-
-            # Decode only new tokens
-            new_tokens = output[0][inputs.input_ids.shape[1]:]
-            return self._hf_tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-        content = await loop.run_in_executor(None, _generate)
+        content = "".join([chunk async for chunk in
+                           self._chat_stream_huggingface(messages, temperature, max_tokens)])
 
         logger.debug("HF response: %d chars", len(content))
         return {"message": {"role": "assistant", "content": content}}
@@ -313,11 +289,12 @@ class LLMClient:
         """
         if self.provider == "huggingface":
             full_text = ""
-            async for chunk in self._chat_stream_huggingface(
+            async with aclosing(self._chat_stream_huggingface(
                 messages, temperature, max_tokens
-            ):
-                full_text += chunk
-                yield {"type": "content", "text": chunk}
+            )) as chunks:
+                async for chunk in chunks:
+                    full_text += chunk
+                    yield {"type": "content", "text": chunk}
             yield {"type": "done", "content": full_text, "tool_calls": []}
             return
 
@@ -358,7 +335,7 @@ class LLMClient:
             "stream": True,
             "keep_alive": "30m",
             "options": {
-                "temperature": temperature or self.config.temperature,
+                "temperature": self.config.temperature if temperature is None else temperature,
                 "top_p": self.config.top_p,
                 "num_predict": max_tokens or self.config.max_tokens,
                 "num_ctx": self.config.context_window,
@@ -412,15 +389,64 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
-        """Stream via HuggingFace (simulated - yields full at once for now)."""
-        # For now, full generation then yield token by token
-        result = await self._chat_huggingface(messages, temperature, max_tokens)
-        content = result.get("message", {}).get("content", "")
+        """Stream decoded text from a serialized, cooperatively cancellable worker."""
+        import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextStreamer
 
-        # Yield token by token (simple char splitting for demo)
-        for char in content:
-            yield char
-            await asyncio.sleep(0.01)  # Simulate streaming
+        assert self._hf_model is not None and self._hf_tokenizer is not None
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        stop = threading.Event()
+
+        class Cancelled(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                return stop.is_set()
+
+        class Streamer(TextStreamer):
+            def on_finalized_text(self, text, stream_end=False):
+                # Preserve tool markers; remove only conversation boundary tokens.
+                for marker in ("<|im_end|>", "<|im_start|>", "<|startoftext|>", "<|endoftext|>"):
+                    text = text.replace(marker, "")
+                if text:
+                    loop.call_soon_threadsafe(queue.put_nowait, text)
+
+        async with self._hf_lock:
+            prompt = self._apply_chat_template(messages)
+            streamer = Streamer(self._hf_tokenizer, skip_prompt=True, skip_special_tokens=False)
+            temp = self.config.temperature if temperature is None else temperature
+
+            def generate():
+                try:
+                    inputs = self._hf_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self._hf_model.device)
+                    options = {"do_sample": temp > 0}
+                    if temp > 0:
+                        options.update(temperature=temp, top_p=self.config.top_p, top_k=self.config.top_k)
+                    with torch.inference_mode():
+                        self._hf_model.generate(
+                            **inputs, **options, streamer=streamer,
+                            stopping_criteria=StoppingCriteriaList([Cancelled()]),
+                            repetition_penalty=self.config.repetition_penalty,
+                            max_new_tokens=max_tokens or self.config.max_tokens,
+                            pad_token_id=self._hf_tokenizer.pad_token_id,
+                            eos_token_id=self._hf_tokenizer.eos_token_id,
+                        )
+                except Exception as exc:
+                    loop.call_soon_threadsafe(queue.put_nowait, exc)
+                finally:
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+            worker = asyncio.create_task(asyncio.to_thread(generate))
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                stop.set()
+                await asyncio.shield(worker)
 
     async def generate(self, prompt: str) -> str:
         """Simple single-shot generation (no chat history)."""

@@ -1,0 +1,37 @@
+# Optional LFM profile. Existing config.yaml / Qwen remains unchanged.
+llm:
+  provider: huggingface
+  model: LiquidAI/LFM2.5-350M
+  temperature: 0.1
+  top_k: 50
+  repetition_penalty: 1.05
+  max_tokens: 256
+  first_response_timeout: 30
+  max_history_chars: 4000
+  system_prompt: >-
+    You are Jarvis, a concise voice assistant. Use tools for actions and report
+    only outcomes supported by tool results. Never invent tool arguments.
+desktop:
+  backend: cua
+  delivery_mode: background
+memory:
+  enabled: false
+voice:
+  wake_word: hey_jarvis
+  sensitivity: 0.4
+  input_device: 2              # JBL Tune 520BT; matches config.yaml
+  output_device: null
+  barge_in: true
+  stt:
+    model: distil-small.en
+    language: en
+    beam_size: 1
+    compute_type: int8
+  tts:
+    engine: kokoro
+    voice: am_michael
+    speed: 1.0
+    sample_rate: 24000
+    piper_model: en_US-lessac-medium.onnx
+security:
+  confirm_dangerous_ops: true
