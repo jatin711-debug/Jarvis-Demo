@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
+from jarvis.agent.permissions import PermissionGateway
 from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -28,6 +29,7 @@ class ToolDefinition:
     handler: Callable[..., Coroutine[Any, Any, Any]]
     requires_confirmation: bool = False
     tags: list[str] = field(default_factory=list)
+    repeatable: bool = False
 
     def to_ollama_schema(self) -> dict[str, Any]:
         """Convert to Ollama tool calling format."""
@@ -58,16 +60,28 @@ def validate_arguments(
     required: list[str] = schema.get("required", [])
 
     coerced = dict(args)
+    missing = [k for k in required if k not in coerced or coerced[k] is None]
+    if missing:
+        return coerced, f"Missing required parameter(s): {', '.join(missing)} for tool '{tool.name}'"
+    if schema.get("additionalProperties") is False:
+        unknown = set(coerced) - set(props)
+        if unknown:
+            return coerced, f"Unknown parameter(s): {', '.join(sorted(unknown))}"
 
     for key, spec in props.items():
         if key not in coerced:
             continue
         value = coerced[key]
         expected = spec.get("type")
+        if value is None:
+            continue
         if expected == "integer" and not isinstance(value, int):
             try:
-                coerced[key] = int(float(str(value)))
-            except (ValueError, TypeError):
+                numeric = float(str(value))
+                if not numeric.is_integer():
+                    raise ValueError("Fractional integer")
+                coerced[key] = int(numeric)
+            except (ValueError, TypeError, OverflowError):
                 return coerced, f"Parameter '{key}' must be an integer, got {value!r}"
         elif expected == "number" and not isinstance(value, (int, float)):
             try:
@@ -113,10 +127,15 @@ class ToolRegistry:
     def __init__(self, confirm_callback: ConfirmCallback | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._confirm_callback = confirm_callback
+        self._permission_gateway: PermissionGateway | None = None
 
     def set_confirm_callback(self, callback: ConfirmCallback | None) -> None:
         """Wire (or clear) the confirmation callback for dangerous tools."""
         self._confirm_callback = callback
+
+    def set_permission_gateway(self, gateway: PermissionGateway | None) -> None:
+        """Apply target/effect policy before confirmation and dispatch."""
+        self._permission_gateway = gateway
 
     def tool(
         self,
@@ -125,6 +144,7 @@ class ToolRegistry:
         parameters: dict[str, Any],
         requires_confirmation: bool = False,
         tags: list[str] | None = None,
+        repeatable: bool = False,
     ) -> Callable:
         """Decorator to register a tool function."""
         def decorator(func: Callable) -> Callable:
@@ -139,6 +159,7 @@ class ToolRegistry:
                 handler=func,
                 requires_confirmation=requires_confirmation,
                 tags=tags or [],
+                repeatable=repeatable,
             )
             self._tools[name] = tool_def
             logger.debug("Registered tool: %s", name)
@@ -160,19 +181,46 @@ class ToolRegistry:
         if not tool:
             raise ValueError(f"Unknown tool: {tool_name}")
 
-        # Enforce confirmation for tools marked dangerous
-        if tool.requires_confirmation and self._confirm_callback is not None:
+        # Reject invalid calls before asking the user to approve anything.
+        kwargs, error = validate_arguments(tool, kwargs)
+        if error:
+            allowed = list(tool.parameters.get("properties", {}))
+            required = tool.parameters.get("required", [])
+            logger.warning("Rejected tool %s: %s; allowed=%s required=%s",
+                           tool_name, error, allowed, required)
+            return (f"❌ Invalid arguments for {tool_name}: {error}. "
+                    f"Allowed parameter names: {allowed}. Required parameter names: {required}. "
+                    "Unknown parameters must be removed, not supplied. No action was executed.")
+
+        if self._permission_gateway is not None:
+            decision = self._permission_gateway.inspect(
+                tool_name, kwargs, tool_requires_confirmation=tool.requires_confirmation)
+            if not decision.allowed:
+                logger.warning("Permission denied for %s: %s", tool_name, decision.reason)
+                return f"Permission denied: {decision.reason}. No action was executed."
+            if decision.requires_confirmation:
+                if self._confirm_callback is None:
+                    return "Permission denied: confirmation is unavailable. No action was executed."
+                summary = {"effect": decision.effect, "target": decision.target,
+                           "action_id": decision.action_id}
+                approved = await self._confirm_callback(tool_name, summary)
+                if not approved:
+                    logger.info("Tool '%s' cancelled by user", tool_name)
+                    return "Action cancelled by the user."
+                # Recheck after a slow voice/text approval. A changed scope
+                # or symlink target cannot inherit the earlier approval.
+                current = self._permission_gateway.inspect(
+                    tool_name, kwargs, tool_requires_confirmation=tool.requires_confirmation)
+                if (not current.allowed or current.action_id != decision.action_id
+                        or current.target != decision.target):
+                    return "Permission denied: target changed during confirmation. No action was executed."
+        elif tool.requires_confirmation and self._confirm_callback is not None:
             approved = await self._confirm_callback(tool_name, kwargs)
             if not approved:
                 logger.info("Tool '%s' cancelled by user", tool_name)
                 return "Action cancelled by the user."
 
-        # Validate/coerce arguments against the schema before running
-        kwargs, error = validate_arguments(tool, kwargs)
-        if error:
-            return f"❌ Invalid arguments for {tool_name}: {error}"
-
-        logger.info("Executing tool: %s(%s)", tool_name, kwargs)
+        logger.info("Executing tool: %s", tool_name)
         try:
             result = await tool.handler(**kwargs)
             logger.info("Tool '%s' completed", tool_name)

@@ -2,13 +2,14 @@
 JARVIS Built-in System Tools
 ==============================
 Core tools for shell commands, file operations, app launching, etc.
-Full admin access — no whitelist, no blocked commands.
+Dispatch is subject to the configured permission gateway.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import ntpath
 import platform
 import re
 import shutil
@@ -20,45 +21,18 @@ from typing import Any
 import psutil
 
 from jarvis.agent.tool_registry import ToolRegistry
+from jarvis.agent.permissions import catastrophic_reason as _catastrophic_reason
 from jarvis.utils.config import SecurityConfig
 from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# Command patterns that are blocked unconditionally — no config opt-out.
-# Everything else is subject to the whitelist/confirmation settings.
-_RM_ROOT = re.compile(
-    r"\brm\s+-\w*r\w*f\w*\s+(/|~|\*|[a-z]:[\\/]?)\s*$", re.IGNORECASE,
-)
-_DEL_SYS = re.compile(
-    r"\b(del|erase|rd|rmdir)\b[^|&]*/s[^|&]*(c:\\|c:/|%systemdrive%|\\windows\b|\\system32\b)",
-    re.IGNORECASE,
-)
-_FORMAT_DISK = re.compile(r"\bformat\s+[a-z]:", re.IGNORECASE)
-
-
-def _catastrophic_reason(command: str) -> str | None:
-    """Return a reason string if the command is catastrophically destructive."""
-    c = command.strip()
-    if _FORMAT_DISK.search(c):
-        return "formats a disk"
-    if re.search(r"\bdiskpart\b", c, re.IGNORECASE):
-        return "modifies disk partitions"
-    if _RM_ROOT.search(c):
-        return "recursively deletes a root/home directory"
-    if _DEL_SYS.search(c):
-        return "recursively deletes system paths"
-    if re.search(r"\bbcdedit\b", c, re.IGNORECASE):
-        return "modifies boot configuration"
-    return None
-
 
 def _first_executable(command: str) -> str:
     """Extract the base executable name from a shell command line."""
     first = command.strip().split()[0] if command.strip() else ""
     # Strip quotes and path, keep basename without extension
     first = first.strip("\"'")
-    base = os.path.basename(first).lower()
+    base = ntpath.basename(first).lower()
     for ext in (".exe", ".bat", ".cmd", ".ps1", ".com"):
         if base.endswith(ext):
             base = base[: -len(ext)]
@@ -97,7 +71,7 @@ def register_system_tools(
 
     @registry.tool(
         name="run_command",
-        description="Execute a shell/terminal command and return the output. You have full admin access.",
+        description="Execute a shell/terminal command and return output, subject to configured permissions.",
         parameters={
             "type": "object",
             "properties": {
@@ -1074,12 +1048,10 @@ def register_system_tools(
             run_at = datetime.now() + timedelta(seconds=max(60, delay_seconds))
             start_time = run_at.strftime("%H:%M")
             start_date = run_at.strftime("%m/%d/%Y")
-            task_cmd = (
-                f'schtasks /create /tn "Jarvis_{task_name}" /tr "{command}" '
-                f"/sc once /st {start_time} /sd {start_date} /f"
-            )
             result = subprocess.run(
-                task_cmd, shell=True, capture_output=True, text=True
+                ["schtasks", "/create", "/tn", f"Jarvis_{task_name}", "/tr", command,
+                 "/sc", "once", "/st", start_time, "/sd", start_date, "/f"],
+                shell=False, capture_output=True, text=True,
             )
             if result.returncode == 0:
                 return f"✅ Scheduled '{task_name}' to run at {start_time} on {start_date}"
@@ -1118,8 +1090,8 @@ def register_system_tools(
         import subprocess
         try:
             result = subprocess.run(
-                f'schtasks /delete /tn "Jarvis_{task_name}" /f',
-                shell=True, capture_output=True, text=True
+                ["schtasks", "/delete", "/tn", f"Jarvis_{task_name}", "/f"],
+                shell=False, capture_output=True, text=True,
             )
             if result.returncode == 0:
                 return f"✅ Deleted task: {task_name}"
