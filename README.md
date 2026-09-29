@@ -8,6 +8,7 @@ A fully local, voice-enabled AI assistant with intelligent memory, natural speec
 - Streaming responses — sentences are spoken as the LLM generates them
 - **Barge-in** — interrupt Jarvis mid-response just by talking
 - ReAct agent with native Ollama tool calling + automatic text-parsing fallback
+- Optional Cua desktop backend and resumable fixture/Calculator acceptance workflows
 - ~40 tools: shell, files, apps, windows, clipboard, browser (Playwright), vision, scheduler, web search
 - Long-term memory (Mem0 + ChromaDB), 100% local embeddings
 - Per-turn latency report (record / STT / memory / LLM / TTS timings)
@@ -40,6 +41,7 @@ playwright install chromium
 # 5. Run Jarvis
 jarvis            # console entry point
 python -m jarvis  # equivalent
+python -m jarvis --text "How are you doing?"  # one turn without voice hardware
 ```
 
 The Piper TTS voice model is auto-downloaded to `~/.jarvis/piper_voices/` on first run
@@ -82,14 +84,18 @@ ruff check .            # lint
 ```
 
 The unit suite mocks the LLM and needs no microphone, Ollama, or models.
-The scripts in `tests/manual/` are interactive and require live services.
+The scripts in `tests/manual/` exercise specific live services. The Cua smoke
+needs an interactive Windows desktop but no model or voice devices. See
+[durable task commands](docs/tasks.md), [current permission behavior](docs/security.md),
+and the [roadmap](docs/roadmap.md).
 
 CI runs pytest + ruff on every push (see `.github/workflows/ci.yml`).
 
 ### Experimental / unreached capabilities
 `ReActAgent.research()` (autonomous web research) and `ReActAgent.computer_use()`
 (see-think-act desktop automation) exist but are not yet wired into the voice loop.
-The HuggingFace LLM provider works but has no true streaming.
+The HuggingFace provider has decoded-text streaming; complex tool reliability
+still needs end-to-end evaluation.
 
 ## License
 MIT

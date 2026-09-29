@@ -18,7 +18,6 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-_CONFIGURED = False
 _LOG_FORMAT = "%(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 
@@ -36,9 +35,6 @@ def setup_logging(
         level: Log level (DEBUG, INFO, WARNING, ERROR)
         log_dir: Directory for log files. None = console only.
     """
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
 
     log_level = getattr(logging, level.upper(), logging.INFO)
 
@@ -49,7 +45,7 @@ def setup_logging(
         show_path=False,
         markup=True,
         rich_tracebacks=True,
-        tracebacks_show_locals=True,
+        tracebacks_show_locals=False,
     )
     rich_handler.setLevel(log_level)
 
@@ -89,18 +85,15 @@ def setup_logging(
                    "mem0", "mem0.memory", "mem0.memory.main"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    _CONFIGURED = True
 
 
 def get_logger(name: str) -> logging.Logger:
     """
-    Get a named logger. Automatically sets up logging on first call.
+    Get a named logger; startup configures handlers explicitly.
 
     Usage:
         from jarvis.utils.logger import get_logger
         logger = get_logger(__name__)
         logger.info("Hello from %s", __name__)
     """
-    if not _CONFIGURED:
-        setup_logging()
     return logging.getLogger(name)

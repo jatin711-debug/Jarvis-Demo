@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -35,16 +35,16 @@ class STTConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    engine: str = "kokoro"
+    engine: Literal["kokoro", "piper"] = "kokoro"
     voice: str = "af_heart"
-    speed: float = 1.0
+    speed: float = Field(default=1.0, gt=0, le=3)
     sample_rate: int = 24000
     piper_model: str = "en_US-lessac-medium.onnx"
 
 
 class VoiceConfig(BaseModel):
     wake_word: str = "hey_jarvis"
-    sensitivity: float = 0.5
+    sensitivity: float = Field(default=0.5, ge=0, le=1)
     input_device: int | None = None
     output_device: int | None = None
     barge_in: bool = True  # Let the user interrupt TTS playback by speaking
@@ -53,15 +53,19 @@ class VoiceConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: str = "ollama"      # "ollama" or "huggingface"
+    provider: Literal["ollama", "huggingface"] = "ollama"
     model: str = "qwen3:1.7b"
     base_url: str = "http://localhost:11434"
-    max_tokens: int = 512
-    temperature: float = 0.6
+    max_tokens: int = Field(default=512, gt=0)
+    temperature: float = Field(default=0.6, ge=0, le=2)
     top_p: float = 0.95
     top_k: int = 50               # For LFM (HuggingFace)
     repetition_penalty: float = 1.05  # For LFM (HuggingFace)
-    context_window: int = 8192
+    context_window: int = Field(default=8192, ge=1024)
+    request_timeout: float = Field(default=120.0, gt=0)
+    first_response_timeout: float = Field(default=30.0, gt=0)
+    max_tool_result_chars: int = Field(default=4000, ge=512)
+    max_history_chars: int = Field(default=8000, ge=0)
     system_prompt: str = (
         "You are Jarvis, a helpful local AI assistant. "
         "Be concise, helpful, and proactive."
@@ -77,8 +81,24 @@ class VectorStoreConfig(BaseModel):
 class MemoryConfig(BaseModel):
     enabled: bool = True
     auto_save: bool = True
-    max_conversation_turns: int = 15
+    retrieval_timeout: float = Field(default=2.0, gt=0)
+    max_conversation_turns: int = Field(default=15, ge=0, le=100)
+    pending_writes: int = Field(default=16, ge=1, le=1000)
+    shutdown_timeout: float = Field(default=10.0, gt=0)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
+
+
+class DesktopConfig(BaseModel):
+    """Cua is opt-in and imported only when selected."""
+
+    backend: Literal["legacy", "cua"] = "legacy"
+    timeout: float = Field(default=30.0, gt=0, le=120)
+    max_elements: int = Field(default=80, ge=1, le=200)
+    max_depth: int = Field(default=10, ge=1, le=20)
+    snapshot_ttl: float = Field(default=30.0, gt=0, le=120)
+    delivery_mode: Literal["background", "foreground"] = "background"
+    telemetry: bool = False
+    update_check: bool = False
 
 
 class SecurityConfig(BaseModel):
@@ -95,6 +115,9 @@ class SecurityConfig(BaseModel):
     allowed_directories: list[str] = Field(default_factory=lambda: [
         "~", "C:\\Users", "D:\\",
     ])
+    # None preserves legacy unrestricted targets; [] denies every target.
+    allowed_applications: list[str] | None = None
+    allowed_hosts: list[str] | None = None
 
 
 class JarvisConfig(BaseModel):
@@ -104,6 +127,7 @@ class JarvisConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)
 
 
 # ──────────────────────────────────────────────
@@ -122,9 +146,7 @@ def _find_config_file() -> Path | None:
     # Check env var first
     env_path = os.environ.get("JARVIS_CONFIG")
     if env_path:
-        p = Path(env_path)
-        if p.exists():
-            return p
+        return expand_path(env_path)
 
     for path in _CONFIG_SEARCH_PATHS:
         if path.exists():
@@ -146,11 +168,11 @@ def load_config(config_path: str | Path | None = None) -> JarvisConfig:
     path: Path | None = None
 
     if config_path:
-        path = Path(config_path)
+        path = expand_path(str(config_path))
     else:
         path = _find_config_file()
 
-    if path and path.exists():
+    if path is not None:
         with open(path, encoding="utf-8") as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
         return JarvisConfig.model_validate(raw)

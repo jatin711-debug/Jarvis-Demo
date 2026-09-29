@@ -90,13 +90,13 @@ class TestPlainAnswers:
     async def test_empty_response_retried(self):
         llm = FakeLLM([{"content": ""}, {"content": "Hi"}])
         agent = ReActAgent(llm=llm, tools=ToolRegistry(), system_prompt="sys")
-        assert await agent.run("hi") == "Hi"
+        assert await agent.run("Explain gravity") == "Hi"
         assert len(llm.calls) == 2
 
     async def test_persistent_empty_gives_up(self):
         llm = FakeLLM([{"content": ""}] * 5)
         agent = ReActAgent(llm=llm, tools=ToolRegistry(), system_prompt="sys")
-        assert await agent.run("hi") == "I couldn't generate a response."
+        assert await agent.run("Explain gravity") == "I couldn't generate a response."
 
     async def test_think_blocks_stripped_from_answer(self):
         llm = FakeLLM([{"content": "<think>hmm let me think</think>The answer is 4."}])
@@ -148,17 +148,17 @@ class TestNativeToolCalling:
     async def test_tool_exception_does_not_crash_loop(self):
         registry = ToolRegistry()
 
-        @registry.tool(name="boom", description="x",
+        @registry.tool(name="get_uptime", description="x",
                        parameters={"type": "object", "properties": {}})
-        async def boom():
+        async def get_uptime():
             raise RuntimeError("kaboom")
 
         llm = FakeLLM([
-            {"content": "", "tool_calls": [{"function": {"name": "boom", "arguments": {}}}]},
+            {"content": "", "tool_calls": [{"function": {"name": "get_uptime", "arguments": {}}}]},
             {"content": "That failed, sorry."},
         ])
         agent = ReActAgent(llm=llm, tools=registry, system_prompt="sys")
-        assert await agent.run("go") == "That failed, sorry."
+        assert await agent.run("what is the uptime") == "That failed, sorry."
         second_msgs = llm.calls[1]["messages"]
         assert any("kaboom" in m.get("content", "") for m in second_msgs)
 
@@ -187,7 +187,7 @@ class TestFallbackTextParsing:
         agent = ReActAgent(
             llm=llm, tools=_registry_with_datetime({}), system_prompt="sys",
         )
-        await agent.run("hi")
+        await agent.run("What time is it?")
         system_msg = llm.calls[0]["messages"][0]["content"]
         assert "tool_call_start" in system_msg
         assert "get_datetime" in system_msg

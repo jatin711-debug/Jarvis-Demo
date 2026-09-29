@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 import time
 from typing import TYPE_CHECKING, Any
 
 from jarvis.agent.llm_client import LLMClient
+from jarvis.agent.permissions import PermissionGateway
 from jarvis.agent.react_agent import ReActAgent
+from jarvis.agent.routing import is_small_talk
 from jarvis.agent.tool_registry import ToolRegistry
+from jarvis.desktop.cua import CuaDesktop, register_desktop_tools
 from jarvis.memory.manager import MemoryManager
 from jarvis.tools.browser_tools import register_browser_tools, shutdown_browser
 from jarvis.tools.system_tools import register_system_tools
@@ -76,6 +80,11 @@ def _is_garbage(text: str) -> bool:
     # hallucinations are handled separately by _is_hallucination().
     return False
 
+
+def _is_explicit_yes(text: str) -> bool:
+    """Voice approval accepts only the requested single-word answer."""
+    return text.strip().casefold().rstrip(".!?").strip() == "yes"
+
 logger = get_logger(__name__)
 
 
@@ -98,6 +107,9 @@ class Orchestrator:
         self.tools: ToolRegistry | None = None
         self.agent: ReActAgent | None = None
         self.memory: MemoryManager | None = None
+        self.desktop: CuaDesktop | None = None
+        self._memory_tasks: set[asyncio.Task] = set()
+        self._memory_lookup: asyncio.Task | None = None
 
         # Voice services
         self.stt: STTEngine | None = None
@@ -109,7 +121,7 @@ class Orchestrator:
 
         # (Echo cancellation is now handled via wake_word.suppress/unsuppress)
 
-    async def startup(self) -> None:
+    async def startup(self, *, voice_enabled: bool = True) -> None:
         """Initialize all services in dependency order."""
         cfg = self.config
 
@@ -135,12 +147,25 @@ class Orchestrator:
         self._browser_tools = ToolRegistry()
         register_browser_tools(self._browser_tools)
 
+        desktop_tools = None
+        if cfg.desktop.backend == "cua":
+            self.desktop = CuaDesktop(cfg.desktop)
+            await self.desktop.startup()
+            desktop_tools = ToolRegistry()
+            register_desktop_tools(desktop_tools, self.desktop)
+
+        gateway = PermissionGateway(cfg.security)
+        for registry in (self.tools, self._browser_tools, desktop_tools):
+            if registry is not None:
+                registry.set_permission_gateway(gateway)
+
         # 5. Agent
         self.agent = ReActAgent(
             llm=self.llm,
             tools=self.tools,
             system_prompt=cfg.llm.system_prompt,
             browser_tools=self._browser_tools,
+            desktop_tools=desktop_tools,
         )
         logger.info("🤖 Agent ready with %d tools (+%d browser on-demand)",
                     len(self.tools), len(self._browser_tools))
@@ -149,14 +174,19 @@ class Orchestrator:
         self.memory = MemoryManager(cfg.memory, cfg.llm)
         await self.memory.startup()
 
-        # 7. Voice stack
-        await self._init_voice(cfg)
+        # 7. Voice stack is optional for text-driven tasks and diagnostics.
+        if voice_enabled:
+            await self._init_voice(cfg)
 
         # 8. Wire confirmation for dangerous tools (voice yes/no)
         if cfg.security.confirm_dangerous_ops:
-            self.tools.set_confirm_callback(self._confirm_tool)
-            self._browser_tools.set_confirm_callback(self._confirm_tool)
-            logger.info("🔒 Voice confirmation enabled for dangerous tools")
+            confirm = self._confirm_tool if voice_enabled else self._confirm_text_tool
+            self.tools.set_confirm_callback(confirm)
+            self._browser_tools.set_confirm_callback(confirm)
+            if desktop_tools is not None:
+                desktop_tools.set_confirm_callback(confirm)
+            logger.info("🔒 %s confirmation enabled for dangerous tools",
+                        "Voice" if voice_enabled else "Text")
 
         self._running = True
         logger.info("✅ All services initialized")
@@ -188,7 +218,7 @@ class Orchestrator:
         assert self.memory is not None
 
         # 1. Retrieve relevant memories (parallelized inside agent if passed as task)
-        context = await self.memory.get_context(text)
+        context = await self._get_memory_context(text)
         if context:
             logger.debug("Retrieved %d memories", len(context))
 
@@ -208,7 +238,7 @@ class Orchestrator:
             self._conversation_history = self._conversation_history[-max_turns:]
 
         # 4. Store in memory (non-blocking)
-        asyncio.create_task(self.memory.add_conversation(text, response))
+        self._save_conversation(text, response)
 
         return response
 
@@ -218,7 +248,7 @@ class Orchestrator:
         assert self.memory is not None
 
         t_turn0 = time.monotonic()
-        context = await self.memory.get_context(text)
+        context = await self._get_memory_context(text)
         t_memory = time.monotonic() - t_turn0
 
         full_response = ""
@@ -280,7 +310,7 @@ class Orchestrator:
         if len(self._conversation_history) > max_turns:
             self._conversation_history = self._conversation_history[-max_turns:]
 
-        asyncio.create_task(self.memory.add_conversation(text, full_response))
+        self._save_conversation(text, full_response)
         return full_response
 
     async def _speak_safe(self, text: str) -> None:
@@ -346,10 +376,13 @@ class Orchestrator:
             logger.warning("Confirmation requested but voice stack unavailable — denying")
             return False
 
-        arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
-        await self._speak_safe(
-            f"This will run {tool_name} with {arg_summary}. Say yes to confirm."
-        )
+        if {"effect", "target", "action_id"} <= args.keys():
+            request = (f"This will {args['effect']} using {tool_name} on {args['target']}. "
+                       f"Action code {args['action_id']}. Say yes to confirm.")
+        else:
+            arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
+            request = f"This will run {tool_name} with {arg_summary}. Say yes to confirm."
+        await self._speak_safe(request)
 
         try:
             audio = await record_until_silence(
@@ -364,11 +397,20 @@ class Orchestrator:
             logger.error("Confirmation recording failed: %s — denying", e)
             return False
 
-        confirmed = text.startswith(("yes", "yeah", "yep", "sure", "confirm", "ok", "okay"))
+        confirmed = _is_explicit_yes(text)
         logger.info("Confirmation for %s: '%s' → %s", tool_name, text, confirmed)
         if not confirmed:
             await self._speak_safe("Cancelled.")
         return confirmed
+
+    async def _confirm_text_tool(self, tool_name: str, args: dict[str, Any]) -> bool:
+        """Ask for an exact yes in interactive text mode; deny in pipelines."""
+        if not sys.stdin.isatty():
+            logger.warning("Text confirmation requires an interactive terminal; denied %s", tool_name)
+            return False
+        summary = ", ".join(f"{key}={value!r}" for key, value in args.items())
+        answer = await asyncio.to_thread(input, f"Approve {tool_name}({summary})? Type yes: ")
+        return answer.strip().casefold() == "yes"
 
     async def _play_beep(self) -> None:
         """Play a short beep to indicate wake word detected."""
@@ -534,18 +576,66 @@ class Orchestrator:
         self._running = False
         logger.info("🔄 Shutting down ...")
 
-        # Close Playwright browser if open
-        await shutdown_browser()
-
-        if self.wake_word:
-            await self.wake_word.shutdown()
-        if self.stt:
-            await self.stt.shutdown()
-        if self.tts:
-            await self.tts.shutdown()
-        if self.memory:
-            await self.memory.shutdown()
-        if self.llm:
-            await self.llm.shutdown()
+        pending = tuple(self._memory_tasks)
+        if self._memory_lookup is not None:
+            pending += (self._memory_lookup,)
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+                                       self.config.memory.shutdown_timeout)
+            except TimeoutError:
+                logger.warning("Memory writes exceeded shutdown deadline")
+        services = [shutdown_browser]
+        services.extend(service.shutdown for service in
+                        (self.wake_word, self.stt, self.tts, self.desktop, self.memory, self.llm)
+                        if service is not None)
+        for close in services:
+            try:
+                await close()
+            except Exception:
+                logger.exception("Service cleanup failed; continuing shutdown")
 
         logger.info("✅ Shutdown complete")
+
+    def _save_conversation(self, text: str, response: str) -> None:
+        if is_small_talk(text):
+            return
+        if self.memory is None or not self.config.memory.auto_save:
+            return
+        if len(self._memory_tasks) >= self.config.memory.pending_writes:
+            logger.warning("Memory write queue full; skipping conversation persistence")
+            return
+        task = asyncio.create_task(self.memory.add_conversation(text, response))
+        self._memory_tasks.add(task)
+
+        def completed(done: asyncio.Task) -> None:
+            self._memory_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error("Conversation persistence failed: %s", done.exception())
+
+        task.add_done_callback(completed)
+
+    async def _get_memory_context(self, text: str) -> list[str]:
+        if is_small_talk(text) or not self.config.memory.enabled or self.memory is None:
+            logger.debug("Memory retrieval skipped for this turn")
+            return []
+        if self._memory_lookup is not None and not self._memory_lookup.done():
+            logger.warning("Previous memory lookup still running; continuing without memory")
+            return []
+        task = asyncio.create_task(self.memory.get_context(text))
+        self._memory_lookup = task
+        # A synchronous embedding call in a worker cannot be forcibly stopped.
+        # Retain it until completion so timeouts cannot build an unbounded queue.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        started = time.monotonic()
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), self.config.memory.retrieval_timeout)
+        except TimeoutError:
+            logger.warning("Memory lookup exceeded %.1fs; continuing without memory",
+                           self.config.memory.retrieval_timeout)
+            return []
+        except Exception:
+            logger.warning("Memory lookup failed; continuing without memory", exc_info=True)
+            return []
+        finally:
+            logger.info("Memory lookup wait: %.2fs", time.monotonic() - started)

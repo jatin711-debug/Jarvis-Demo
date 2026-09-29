@@ -50,6 +50,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = ["cua-driver==0.28.2"]
+lfm = ["transformers>=5.16.1,<6", "torch>=2.6", "accelerate>=1.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

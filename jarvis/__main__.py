@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
         "--config", type=str, default=None,
         help="Path to config.yaml (default: auto-detect)"
     )
+    parser.add_argument("--text", type=str, default=None,
+                        help="Run one text turn without microphone, wake word, or speech output")
     return parser.parse_args()
 
 
@@ -67,15 +69,19 @@ async def main() -> None:
 
     orchestrator = Orchestrator(config)
     try:
-        await orchestrator.startup()
+        await orchestrator.startup(voice_enabled=args.text is None)
+        if args.text is None:
+            await orchestrator.run()
+        else:
+            if not args.text.strip():
+                raise ValueError("--text must be non-empty")
+            print(await orchestrator._handle_user_message(args.text))
     except RuntimeError as e:
         # Preflight failures (Ollama down, model not pulled, ...) — fail fast
         # with an actionable message instead of booting into broken turns.
         logger.error("❌ Startup preflight failed: %s", e)
         sys.exit(1)
 
-    try:
-        await orchestrator.run()
     except KeyboardInterrupt:
         logger.info("🛑 Shutdown requested by user")
     finally:

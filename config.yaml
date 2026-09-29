@@ -2,6 +2,12 @@
 # JARVIS Configuration — Voice-Only
 # ================================
 
+desktop:
+  backend: cua                # Install pip install -e ".[desktop]"; legacy disables Cua
+  delivery_mode: background   # Never silently switch to foreground input
+  telemetry: false
+  update_check: false
+
 system:
   name: "Jarvis"
   debug: true
@@ -36,20 +42,21 @@ llm:
   model: "qwen3.5:2b"      # Q8_0, fits 4GB VRAM fully; vision+tools capable
   base_url: "http://localhost:11434"  # Ollama default port
   max_tokens: 512              # short voice responses
+  first_response_timeout: 30   # Stop silent model waits; do not retry this deadline
   temperature: 0.1            # LFM recommended (also works for Qwen)
   top_p: 0.9
   top_k: 50                   # LFM recommended
   repetition_penalty: 1.05     # LFM recommended
   context_window: 4096        # Minimal context for speed
   system_prompt: |
-    You are Jarvis, a voice-controlled AI assistant with FULL admin access
-    to the user's Windows system.
+    You are Jarvis, a voice-controlled AI assistant with access to configured
+    tools on the user's Windows system. Tool permissions still apply.
 
     RULES:
     - Be concise (responses are spoken aloud via TTS)
     - Keep responses to 1-2 sentences
     - When executing commands, briefly confirm what you did
-    - You have unrestricted access — no need to ask for permission
+    - Do not assume an action is authorized or completed; follow tool results
     - For time/date questions, use the get_datetime tool
     - open_application is ONLY for desktop apps (notepad, calculator, etc.)
     - For web tasks, use the browser_* tools

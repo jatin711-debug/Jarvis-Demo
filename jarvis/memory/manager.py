@@ -78,7 +78,7 @@ class MemoryManager:
                 },
             }
 
-            self._memory = Memory.from_config(config)
+            self._memory = await asyncio.to_thread(Memory.from_config, config)
             self._session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
             logger.info("✅ Mem0 initialized (vectors: %s)", vector_path)
 
@@ -113,8 +113,10 @@ class MemoryManager:
             {"role": "assistant", "content": assistant_response},
         ]
 
+        backend = self._memory
+
         def _add():
-            self._memory.add(
+            backend.add(
                 conversation,
                 user_id=uid,
                 metadata={
@@ -147,8 +149,10 @@ class MemoryManager:
 
         uid = user_id or self._user_id
 
+        backend = self._memory
+
         def _search():
-            return self._memory.search(
+            return backend.search(
                 query=query,
                 user_id=uid,
                 limit=limit,
@@ -173,8 +177,10 @@ class MemoryManager:
 
         uid = user_id or self._user_id
 
+        backend = self._memory
+
         def _get_all():
-            return self._memory.get_all(user_id=uid)
+            return backend.get_all(user_id=uid)
 
         loop = asyncio.get_event_loop()
         try:

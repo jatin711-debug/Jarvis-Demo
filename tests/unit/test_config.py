@@ -43,9 +43,9 @@ class TestYamlLoading:
         cfg = load_config(cfg_file)
         assert cfg == JarvisConfig()
 
-    def test_missing_explicit_path_gives_defaults(self, tmp_path):
-        cfg = load_config(tmp_path / "does_not_exist.yaml")
-        assert cfg == JarvisConfig()
+    def test_missing_explicit_path_fails_clearly(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_config(tmp_path / "does_not_exist.yaml")
 
     def test_invalid_yaml_shape_rejected(self, tmp_path):
         cfg_file = tmp_path / "config.yaml"
