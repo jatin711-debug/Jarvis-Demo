@@ -45,12 +45,12 @@ READ_TOOLS = frozenset({
     "read_file", "list_directory", "search_files", "get_system_info", "get_running_processes",
     "get_datetime", "get_uptime", "clipboard_read", "scheduler_list", "web_search",
     "browser_read_page", "browser_get_info", "browser_list_tabs", "desktop_windows",
-    "desktop_observe",
+    "desktop_observe", "read_pdf", "read_spreadsheet", "read_image", "find_ui_elements",
 })
 LOCAL_TOOLS = frozenset({
     "write_file", "copy_file", "move_file", "delete_file", "create_directory", "set_volume",
     "take_screenshot", "clipboard_write", "type_text", "focus_window", "send_keystrokes",
-    "window_management", "browser_type", "browser_scroll", "browser_screenshot", "browser_back",
+    "window_management", "click_ui_element", "browser_type", "browser_scroll", "browser_screenshot", "browser_back",
     "browser_forward", "browser_switch_tab", "browser_close", "desktop_click", "desktop_type",
     "desktop_key",
 })
@@ -64,12 +64,19 @@ EXTERNAL_TOOLS = frozenset({
 })
 KNOWN_TOOLS = READ_TOOLS | LOCAL_TOOLS | CONTROL_TOOLS | EXTERNAL_TOOLS
 
+# Registered but always refused: they act without an exact window/element target.
+# Cua's observed pid/window/snapshot controls replace them.
+REFUSED_TOOLS = frozenset({
+    "type_text", "send_keystrokes", "focus_window", "window_management", "click_ui_element",
+})
+
 PATH_FIELDS = {
     "read_file": ("file_path",), "write_file": ("file_path",),
     "list_directory": ("path",), "search_files": ("directory",),
     "copy_file": ("source", "destination"), "move_file": ("source", "destination"),
     "delete_file": ("path",), "create_directory": ("path",),
     "take_screenshot": ("save_path",), "browser_screenshot": ("save_path",),
+    "read_pdf": ("path",), "read_spreadsheet": ("path",), "read_image": ("path",),
 }
 DEFAULT_PATHS = {"take_screenshot": Path.home() / ".jarvis" / "screenshot.png",
                  "browser_screenshot": Path.home() / ".jarvis" / "browser_screenshot.png"}
@@ -227,6 +234,8 @@ class PermissionGateway:
                 raise ValueError("Global typing/keystrokes have no exact target; use Cua desktop controls")
             elif name in {"focus_window", "window_management"}:
                 raise ValueError("Title-substring window actions have no exact target; use Cua")
+            elif name == "click_ui_element":
+                raise ValueError("Screen-coordinate clicks have no exact target; use Cua desktop controls")
             elif name.startswith("desktop_") and name not in {"desktop_windows", "desktop_launch"}:
                 target = f"pid={args.get('pid')}, window_id={args.get('window_id')}"
             elif name.startswith("browser_") and self.security.allowed_hosts is not None:
