@@ -1,11 +1,17 @@
 # Jarvis roadmap: reliable end-to-end work
 
 Current progress: baseline unit/lint checks, the isolated Cua restart/resume
-scenario, the text CLI, and the fixture-scoped task record are implemented.
-Milestone 2 has begun with a durable Calculator scenario, a narrowed agent
-tool menu, and an initial permission gateway. Common typed tool outcomes,
+scenario, the text CLI, and the durable task engine are implemented. Workflows
+are declarative step contracts (target, precondition, action, independently
+verified postcondition, timeout, retry policy, evidence) run by a generic
+engine with inspect/act/verify phases, per-task time and action budgets, and a
+versioned, migrating task store. Milestone 2 has begun with a durable
+Calculator scenario, a single capability router that offers one tool surface
+per request, a permission gateway with an enforced tool classification, and a
+standard security profile as the default. Still future work: LLM-driven
+planning that creates tasks from open-ended goals, common typed tool outcomes,
 complete browser target binding, durable cross-app handoffs, voice task
-controls, and retention remain future work.
+controls, and retention.
 
 ## Goal and operating rules
 

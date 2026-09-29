@@ -1,276 +1,289 @@
-"""Small deterministic workflow with checkpoints and independent postconditions."""
+"""Generic durable workflow engine.
+
+Each step of a registered workflow runs through explicit phases:
+
+* inspect: take a fresh observation and check whether the postcondition
+  already holds; if so, reconcile without acting.
+* act: check the precondition and budgets, journal ``action_intent`` before
+  dispatching, then dispatch.
+* verify: judge the postcondition on a fresh observation, then advance.
+
+Anything uncertain stops in ``needs_review`` (a journaled dispatch is never
+replayed); a wait for an absent target stops in ``paused``.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import inspect
+import json
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from jarvis.agent.permissions import PermissionGateway
-from jarvis.tasks.store import WORKFLOW_STEPS, StateConflict, TaskStore
+from jarvis.tasks.contracts import Check, StepContext, StepContract, StepReview, Workflow
+from jarvis.tasks.store import StateConflict, TaskStore
+from jarvis.tasks.workflows import get_workflow
+from jarvis.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_TERMINAL = frozenset({"completed", "cancelled"})
+
+
+async def _settle(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+def _check(value: Any, contract: StepContract, what: str) -> Check:
+    if not isinstance(value, Check):
+        raise TypeError(f"Step {contract.name} {what} must return a Check, got {type(value).__name__}")
+    return value
+
+
+def _short(task: dict[str, Any]) -> str:
+    return task["id"][:8]
+
+
+def _line(text: str) -> str:
+    collapsed = " ".join(str(text).split())
+    return collapsed if len(collapsed) <= 240 else collapsed[:237] + "..."
 
 
 class TaskRunner:
     def __init__(self, store: TaskStore, desktop: Any,
-                 permission_gateway: PermissionGateway | None = None) -> None:
+                 permission_gateway: PermissionGateway | None = None, *,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.store = store
         self.desktop = desktop
         self.permission_gateway = permission_gateway
+        self.clock = clock
 
     async def run(self, task_id: str, *, pause_after: int | None = None) -> dict[str, Any]:
         if pause_after is not None and pause_after < 1:
             raise ValueError("pause_after must be positive")
         task = self.store.get(task_id)
-        if task["workflow"] not in WORKFLOW_STEPS:
-            raise ValueError("Unsupported workflow")
-        steps = WORKFLOW_STEPS[task["workflow"]]
-        if task["status"] in {"completed", "cancelled"}:
+        workflow = get_workflow(task["workflow"])
+        if task["status"] in _TERMINAL:
             return task
-        if self.permission_gateway is not None:
-            if task["workflow"] == "desktop_save_fixture":
-                checks = (
-                    ("read_file", {"file_path": task["scope"]["output_path"]}),
-                    ("write_file", {"file_path": task["scope"]["output_path"],
-                                    "content": task["input"]["text"]}),
-                )
-            else:
-                checks = (("desktop_launch", {"name": "Calculator"}),)
-            for name, arguments in checks:
-                decision = self.permission_gateway.inspect(name, arguments)
+        return await _Execution(self, workflow, task, pause_after).run(task)
+
+
+class _Execution:
+    """One ``TaskRunner.run`` call: its clock, phase, and verified-step count."""
+
+    def __init__(self, runner: TaskRunner, workflow: Workflow, task: dict[str, Any],
+                 pause_after: int | None) -> None:
+        self.store = runner.store
+        self.desktop = runner.desktop
+        self.gateway = runner.permission_gateway
+        self.clock = runner.clock
+        self.workflow = workflow
+        self.pause_after = pause_after
+        self.base_elapsed = float(task["elapsed_seconds"])
+        self.began = self.clock()
+        self.verified = 0
+        self.phase = "start"
+
+    def elapsed(self) -> float:
+        return self.base_elapsed + (self.clock() - self.began)
+
+    def _step_name(self, task: dict[str, Any]) -> str:
+        index = task["current_step"]
+        return self.workflow.steps[index].name if index < len(self.workflow.steps) else "-"
+
+    def _record(self, task: dict[str, Any], kind: str, *, details: dict[str, Any] | None = None,
+                **changes: Any) -> dict[str, Any]:
+        return self.store.record(task, kind, details=details,
+                                 elapsed_seconds=round(self.elapsed(), 3), **changes)
+
+    def _halt(self, task: dict[str, Any], status: str, kind: str, reason: str, *,
+              details: dict[str, Any] | None = None) -> dict[str, Any]:
+        step = self._step_name(task)
+        halted = self._record(task, kind, status=status, error=reason,
+                              details={"step": step, "phase": self.phase, **(details or {})})
+        logger.info("task %s id=%s step=%s phase=%s reason=%s", status, _short(task), step,
+                    self.phase, _line(reason))
+        return halted
+
+    def _budget_reason(self, task: dict[str, Any], *, dispatching: bool = False) -> str | None:
+        budget = task["budget"]
+        elapsed = self.elapsed()
+        if elapsed > budget["max_seconds"]:
+            return (f"Time budget exhausted: {elapsed:.1f}s used of "
+                    f"{budget['max_seconds']:g}s; raise the budget to continue")
+        if dispatching and task["actions_taken"] >= budget["max_actions"]:
+            return (f"Action budget exhausted: {task['actions_taken']} of "
+                    f"{budget['max_actions']} mutating actions used; raise the budget to continue")
+        return None
+
+    async def run(self, task: dict[str, Any]) -> dict[str, Any]:
+        steps = self.workflow.steps
+        if self.gateway is not None and self.workflow.permissions is not None:
+            self.phase = "permission"
+            for name, arguments in self.workflow.permissions(task):
+                decision = self.gateway.inspect(name, dict(arguments))
                 if not decision.allowed:
-                    return self.store.record(task, "permission_denied", status="needs_review",
-                                             error=decision.reason,
-                                             details={"tool": name, "target": decision.target})
-        task = self.store.record(task, "resumed" if task["status"] != "pending" else "started",
-                                 status="running", error=None)
-        completed_steps = 0
+                    return self._halt(task, "needs_review", "permission_denied", decision.reason,
+                                      details={"tool": name, "target": decision.target})
+        resuming = task["status"] != "pending"
+        self.phase = "start"
+        task = self._record(task, "resumed" if resuming else "started", status="running",
+                            error=None, started_at=task["started_at"] or datetime.now(UTC).isoformat(),
+                            details={"step": self._step_name(task), "phase": "start"})
+        if resuming:
+            logger.info("task resumed id=%s workflow=%s step=%s n=%d/%d", _short(task),
+                        task["workflow"], self._step_name(task), task["current_step"], len(steps))
+        else:
+            logger.info("task started id=%s workflow=%s steps=%d input_len=%d", _short(task),
+                        task["workflow"], len(steps),
+                        len(json.dumps(task["input"], ensure_ascii=False, default=str)))
         try:
             while task["current_step"] < len(steps):
-                step = task["current_step"]
-                if task["workflow"] == "calculator_1_plus_2":
-                    task = await self._calculator_step(task)
-                elif step == 0:
-                    task = await self._discover(task)
-                elif step == 1:
-                    task = await self._type(task)
-                elif step == 2:
-                    task = await self._save(task)
-                else:
-                    task = await self._verify(task)
+                self.phase = "budget"
+                reason = self._budget_reason(task)
+                if reason:
+                    return self._halt(task, "needs_review", "budget_exhausted", reason)
+                task = await self._run_step(task, steps[task["current_step"]])
                 if task["status"] != "running":
                     return task
-                completed_steps += 1
-                if pause_after is not None and completed_steps >= pause_after:
-                    return self.store.record(task, "paused_at_boundary", status="paused",
-                                             details={"next_step": task["current_step"]})
+                self.verified += 1
+                if self.pause_after is not None and self.verified >= self.pause_after:
+                    logger.info("task paused id=%s step=%s reason=pause_after n=%d",
+                                _short(task), self._step_name(task), self.verified)
+                    return self._record(task, "paused_at_boundary", status="paused",
+                                        details={"next_step": task["current_step"],
+                                                 "phase": "boundary"})
             return task
         except StateConflict:
             raise
         except asyncio.CancelledError:
-            current = self.store.get(task_id)
-            if current["status"] not in {"completed", "cancelled"}:
-                self.store.record(current, "interrupted", status="needs_review",
-                                  error="Execution interrupted; inspect outcome before resuming")
+            current = self.store.get(task["id"])
+            if current["status"] not in _TERMINAL:
+                self.phase = "interrupt"
+                self._halt(current, "needs_review", "interrupted",
+                           "Execution interrupted; inspect outcome before resuming")
             raise
+        except StepReview as exc:
+            return self._halt_current(task, "needs_review", str(exc))
         except Exception as exc:
-            current = self.store.get(task_id)
-            if current["status"] in {"completed", "cancelled"}:
-                return current
-            return self.store.record(current, "step_error", status="needs_review", error=str(exc),
-                                     details={"step": steps[current["current_step"]]})
+            logger.debug("task step exception id=%s", _short(task), exc_info=True)
+            return self._halt_current(task, "needs_review", str(exc) or type(exc).__name__,
+                                      kind="step_error")
 
-    def _advance(self, task: dict[str, Any], details: dict[str, Any]) -> dict[str, Any]:
+    def _halt_current(self, task: dict[str, Any], status: str, reason: str, *,
+                      kind: str = "needs_review") -> dict[str, Any]:
+        current = self.store.get(task["id"])
+        if current["status"] in _TERMINAL:
+            return current
+        return self._halt(current, status, kind, reason)
+
+    async def _run_step(self, task: dict[str, Any], contract: StepContract) -> dict[str, Any]:
+        reobserved = 0
+        while True:
+            self.phase = "inspect"
+            try:
+                async with asyncio.timeout(contract.timeout) as deadline:
+                    return await self._execute(task, contract)
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+            current = self.store.get(task["id"])
+            limit = f"{contract.timeout:g}s"
+            if contract.operation == "mutate":
+                if current["attempt"] is not None:
+                    reason = (f"Step {contract.name} timed out after {limit} during {self.phase}; "
+                              "the action may have taken effect, so it is not replayed")
+                else:
+                    reason = (f"Step {contract.name} timed out after {limit} during {self.phase} "
+                              "before any action was dispatched")
+                return self._halt(current, "needs_review", "step_timeout", reason)
+            if reobserved < contract.retry.reobserve:
+                reobserved += 1
+                task = current
+                logger.debug("task reobserve id=%s step=%s attempt=%d", _short(task),
+                             contract.name, reobserved + 1)
+                continue
+            return self._halt(current, "paused", "step_timeout",
+                              f"Step {contract.name} timed out after {limit}; nothing was changed")
+
+    async def _execute(self, task: dict[str, Any], contract: StepContract) -> dict[str, Any]:
+        tag = _short(task)
+        ctx = StepContext(task, self.desktop)
+        logger.debug("task phase id=%s step=%s phase=inspect", tag, contract.name)
+        observed = await _settle(contract.observe(ctx))
+        post = _check(await _settle(contract.postcondition(ctx, observed)), contract, "postcondition")
+        attempted = task["attempt"] is not None
+        if post.held and (contract.operation == "read" or (
+                contract.retry.reconcile if attempted else contract.retry.adopt_satisfied)):
+            return self._advance(task, contract, observed, phase="inspect",
+                                 reconciled=attempted and contract.operation == "mutate")
+        if contract.action is None:
+            reason = post.reason or f"Step {contract.name} postcondition not met"
+            if contract.on_unmet == "pause":
+                return self._halt(task, "paused", "waiting", reason)
+            return self._halt(task, "needs_review", "needs_review", reason)
+        if attempted:
+            reason = contract.uncertain
+            if contract.retry.reconcile and post.reason:
+                reason = f"{reason}; {post.reason}"
+            return self._halt(task, "needs_review", "needs_review", reason)
+
+        self.phase = "act"
+        logger.debug("task phase id=%s step=%s phase=act", tag, contract.name)
+        pre = (_check(await _settle(contract.precondition(ctx, observed)), contract, "precondition")
+               if contract.precondition else Check(True, handle=observed))
+        if not pre.held:
+            return self._halt(task, "needs_review", "needs_review",
+                              pre.reason or f"Step {contract.name} precondition not met")
+        reason = self._budget_reason(task, dispatching=True)
+        if reason:
+            return self._halt(task, "needs_review", "budget_exhausted", reason)
+        task = self._record(task, "action_intent", attempt={"step": contract.name},
+                            actions_taken=task["actions_taken"] + 1,
+                            details={"step": contract.name, "phase": "act",
+                                     "target": contract.target,
+                                     "action_n": task["actions_taken"] + 1})
+        logger.debug("task dispatch id=%s step=%s action_n=%d", tag, contract.name,
+                     task["actions_taken"])
+        ctx = StepContext(task, self.desktop)
+        result = await _settle(contract.action(ctx, pre.handle))
+
+        self.phase = "verify"
+        logger.debug("task phase id=%s step=%s phase=verify", tag, contract.name)
+        after = await _settle(contract.observe_after(ctx, observed, result)
+                              if contract.observe_after else contract.observe(ctx))
+        post = _check(await _settle(contract.postcondition(ctx, after)), contract, "postcondition")
+        if not post.held:
+            return self._halt(task, "needs_review", "needs_review",
+                              f"Step {contract.name} postcondition not verified: {post.reason}")
+        return self._advance(task, contract, after, phase="verify", reconciled=False)
+
+    def _advance(self, task: dict[str, Any], contract: StepContract, observed: Any, *,
+                 phase: str, reconciled: bool) -> dict[str, Any]:
+        details = dict(contract.evidence(StepContext(task, self.desktop), observed, phase))
+        if reconciled:
+            details["reconciled"] = True
+        steps = self.workflow.steps
+        index = task["current_step"]
         statuses = list(task["step_status"])
-        calculator_plus = task["workflow"] == "calculator_1_plus_2" and task["current_step"] == 3
-        statuses[task["current_step"]] = "acknowledged" if calculator_plus else "verified"
-        steps = WORKFLOW_STEPS[task["workflow"]]
-        evidence = [*task["evidence"], {"step": steps[task["current_step"]], **details}]
-        next_step = task["current_step"] + 1
-        if task["workflow"] == "calculator_1_plus_2" and next_step == len(steps):
-            # The operator itself leaves the display unchanged. Only the
-            # final observed arithmetic result confirms that it was applied.
-            statuses[3] = "verified"
-        return self.store.record(task, "step_verified", details=details,
-                                 current_step=next_step, step_status=statuses,
-                                 evidence=evidence, attempt=None,
-                                 status="completed" if next_step == len(steps) else "running",
-                                 result=("File contents verified" if task["workflow"] == "desktop_save_fixture"
-                                         else "Calculator displayed 3 after 1+2")
-                                 if next_step == len(steps) else None)
-
-    def _review(self, task: dict[str, Any], reason: str) -> dict[str, Any]:
-        return self.store.record(task, "needs_review", status="needs_review", error=reason,
-                                 details={"step": WORKFLOW_STEPS[task["workflow"]][task["current_step"]]})
-
-    async def _window(self, task: dict[str, Any]) -> dict[str, Any]:
-        listing = await self.desktop.windows()
-        if listing.get("truncated"):
-            raise RuntimeError("Window list is truncated; cannot prove a unique target")
-        matches = [window for window in listing["windows"]
-                   if window.get("title") == task["scope"]["window_title"]]
-        if len(matches) != 1:
-            raise RuntimeError(f"Expected one exact fixture window; found {len(matches)}")
-        if (task["workflow"] == "calculator_1_plus_2"
-                and matches[0].get("app_name") not in {
-                    "ApplicationFrameHost.exe", "CalculatorApp.exe", "Calculator.exe"}):
-            raise RuntimeError("Calculator title belongs to an unexpected app")
-        return matches[0]
-
-    async def _observe(self, task: dict[str, Any]) -> dict[str, Any]:
-        window = await self._window(task)
-        return await self.desktop.observe(window["pid"], window["window_id"])
-
-    @staticmethod
-    def _control(state: dict[str, Any], label: str) -> dict[str, Any]:
-        matches = [element for element in state["elements"]
-                   if element.get("label") == label and element.get("enabled") is not False]
-        # Cua may return a valid target token while elements_complete is false.
-        # Act only on the exact returned control; never infer absent controls
-        # from an incomplete tree.
-        if state.get("degraded") or state.get("truncated") or len(matches) != 1:
-            raise RuntimeError(
-                f"Cannot identify one enabled '{label}' control "
-                f"(matches={len(matches)}, degraded={state.get('degraded')}, "
-                f"truncated={state.get('truncated')}, complete={state.get('elements_complete')})"
-            )
-        if not state.get("snapshot_id") or matches[0].get("element_index") is None:
-            raise RuntimeError("Control lacks a fresh action target")
-        return matches[0]
-
-    async def _file_state(self, task: dict[str, Any]) -> str:
-        target = Path(task["scope"]["output_path"])
-
-        def check() -> str:
-            if not target.exists():
-                return "absent"
-            return "match" if target.read_text(encoding="utf-8-sig") == task["input"]["text"] else "mismatch"
-
-        return await asyncio.to_thread(check)
-
-    async def _discover(self, task: dict[str, Any]) -> dict[str, Any]:
-        try:
-            window = await self._window(task)
-        except RuntimeError as exc:
-            return self.store.record(task, "waiting_for_window", status="paused", error=str(exc))
-        return self._advance(task, {"window_title": window["title"]})
-
-    async def _type(self, task: dict[str, Any]) -> dict[str, Any]:
-        state = await self._observe(task)
-        editor = self._control(state, "Smoke text")
-        desired = task["input"]["text"]
-        if editor.get("value") == desired:
-            return self._advance(task, {"observed_value": "matched"})
-        if task["attempt"] is not None:
-            return self._review(task, "Previous text action has an uncertain outcome; inspect the fixture")
-        task = self.store.record(task, "action_intent", attempt={"step": "enter_text"},
-                                 details={"step": "enter_text", "target": "Smoke text"})
-        result = await self.desktop.act("type_text", state["pid"], state["window_id"],
-                                        state["snapshot_id"], editor["element_index"], text=desired)
-        after = result.get("after")
-        if not after:
-            return self._review(task, "Text dispatch returned no post-action observation")
-        matches = [element for element in after["elements"] if element.get("label") == "Smoke text"]
-        if len(matches) != 1 or matches[0].get("value") != desired:
-            return self._review(task, "Text value was not verified after dispatch")
-        return self._advance(task, {"observed_value": "matched"})
-
-    async def _save(self, task: dict[str, Any]) -> dict[str, Any]:
-        file_state = await self._file_state(task)
-        if file_state == "match":
-            return self._advance(task, {"file": "exact bytes matched", "source": "independent read"})
-        if file_state == "mismatch":
-            return self._review(task, "Output path already exists with different contents")
-        if task["attempt"] is not None:
-            return self._review(task, "Previous Save action may have reached the app; no automatic replay")
-        state = await self._observe(task)
-        button = self._control(state, "Save smoke file")
-        task = self.store.record(task, "action_intent", attempt={"step": "save_file"},
-                                 details={"step": "save_file", "target": "Save smoke file"})
-        await self.desktop.act("click", state["pid"], state["window_id"],
-                               state["snapshot_id"], button["element_index"])
-        for _ in range(20):
-            file_state = await self._file_state(task)
-            if file_state != "absent":
-                break
-            await asyncio.sleep(0.1)
-        if file_state != "match":
-            return self._review(task, f"Save outcome not verified: {file_state}")
-        return self._advance(task, {"file": "exact bytes matched", "source": "independent read"})
-
-    async def _verify(self, task: dict[str, Any]) -> dict[str, Any]:
-        file_state = await self._file_state(task)
-        if file_state != "match":
-            return self._review(task, f"Final file verification failed: {file_state}")
-        return self._advance(task, {"file": "exact bytes matched", "source": "independent read"})
-
-    async def _calculator_step(self, task: dict[str, Any]) -> dict[str, Any]:
-        step = task["current_step"]
-        if step == 0:
-            listing = await self.desktop.windows()
-            if listing.get("truncated"):
-                return self._review(task, "Window list truncated; exact Calculator target is uncertain")
-            matches = [w for w in listing["windows"] if w.get("title") == "Calculator"]
-            if not matches:
-                if task["attempt"] is not None:
-                    return self._review(task, "Calculator launch outcome uncertain; do not launch twice")
-                task = self.store.record(task, "action_intent", attempt={"step": "discover_calculator"},
-                                         details={"app": "Calculator", "action": "launch"})
-                await self.desktop.launch("Calculator")
-                listing = await self.desktop.windows()
-                if listing.get("truncated"):
-                    return self._review(task, "Window list truncated after Calculator launch")
-                matches = [w for w in listing["windows"] if w.get("title") == "Calculator"]
-            if len(matches) != 1 or matches[0].get("app_name") not in {
-                    "ApplicationFrameHost.exe", "CalculatorApp.exe", "Calculator.exe"}:
-                return self._review(task, "Calculator target is absent, ambiguous, or not the expected app")
-            return self._advance(task, {"target": {"pid": matches[0]["pid"],
-                                                    "window_id": matches[0]["window_id"],
-                                                    "title": matches[0]["title"]},
-                                        "source": "Cua window inventory"})
-
-        state = await self._observe(task)
-        if state.get("title") != "Calculator" or state.get("degraded") or state.get("truncated"):
-            return self._review(task, "Calculator observation is incomplete or target changed")
-        displays = [e["label"].removeprefix("Display is ") for e in state["elements"]
-                    if isinstance(e.get("label"), str) and e["label"].startswith("Display is ")]
-        if len(displays) != 1:
-            return self._review(task, "Cannot read one Calculator display")
-        display = displays[0].replace(",", "").strip()
-        labels = ("Clear", "One", "Plus", "Two", "Equals")
-        expected_before = (None, "0", "0", "1", "1", "2")
-        expected_after = (None, "0", "1", "1", "2", "3")
-        label = labels[step - 1]
-        if task["attempt"] is not None:
-            # Plus leaves the same display, so UIA cannot establish that it
-            # happened after a lost acknowledgement. Stop rather than replay.
-            if step == 3:
-                return self._review(task, "Plus dispatch uncertain; display cannot prove operation")
-            if display == expected_after[step]:
-                return self._advance(task, {"display": display, "source": "fresh Cua observation",
-                                            "reconciled": True})
-            return self._review(task, f"Prior {label} action uncertain; observed display {display}")
-        if step == 1 and display == "0":
-            return self._advance(task, {"display": display, "source": "fresh Cua observation"})
-        if step != 1 and display != expected_before[step]:
-            return self._review(task, f"Calculator changed before {label}: expected display "
-                              f"{expected_before[step]}, observed {display}")
-        control = self._control(state, label)
-        task = self.store.record(task, "action_intent", attempt={"step": WORKFLOW_STEPS[task["workflow"]][step]},
-                                 details={"target": "Calculator", "control": label,
-                                          "display_before": display})
-        result = await self.desktop.act("click", state["pid"], state["window_id"],
-                                        state["snapshot_id"], control["element_index"])
-        after = result.get("after")
-        if (not after or after.get("pid") != state["pid"]
-                or after.get("window_id") != state["window_id"]
-                or after.get("degraded") or after.get("truncated")):
-            return self._review(task, f"{label} dispatch has no trustworthy post-action observation")
-        observed = [e["label"].removeprefix("Display is ") for e in after["elements"]
-                    if isinstance(e.get("label"), str) and e["label"].startswith("Display is ")]
-        if len(observed) != 1 or observed[0].replace(",", "").strip() != expected_after[step]:
-            return self._review(task, f"{label} postcondition not verified: {observed}")
-        return self._advance(task, {"display": expected_after[step],
-                                    "source": "Cua post-action observation",
-                                    "control": label,
-                                    "note": "Plus is confirmed by dispatch; final arithmetic result verifies sequence"
-                                    if step == 3 else ""})
+        statuses[index] = "acknowledged" if contract.confirmed_by else "verified"
+        for earlier, step in enumerate(steps[:index]):
+            if step.confirmed_by == contract.name and statuses[earlier] == "acknowledged":
+                statuses[earlier] = "verified"
+        done = index + 1 == len(steps)
+        task = self._record(
+            task, "step_verified", details={"step": contract.name, "phase": phase, **details},
+            current_step=index + 1, step_status=statuses,
+            evidence=[*task["evidence"], {"step": contract.name, **details}], attempt=None,
+            status="completed" if done else "running",
+            result=self.workflow.result if done else None)
+        logger.info("task step verified id=%s step=%s n=%d/%d%s", _short(task), contract.name,
+                    index + 1, len(steps), " reconciled=true" if reconciled else "")
+        if done:
+            logger.info("task completed id=%s workflow=%s elapsed_s=%.1f actions=%d",
+                        _short(task), task["workflow"], task["elapsed_seconds"],
+                        task["actions_taken"])
+        return task

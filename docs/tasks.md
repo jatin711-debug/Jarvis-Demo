@@ -13,7 +13,10 @@ resumable task. The persistent task command below is a separate first workflow.
 
 `python -m jarvis.tasks` manages records in `~/.jarvis/tasks.sqlite3` by default.
 Use `--db PATH` to direct it to a test database. Its commands are `list`,
-`status TASK_ID`, `cancel TASK_ID`, and `resume TASK_ID`.
+`status TASK_ID`, `cancel TASK_ID`, and `resume TASK_ID`. Progress lines
+(`task step verified id=... step=... n=2/4`) go to stderr with the task id
+shortened to 8 characters; task input is never logged, only its length. The
+JSON result goes to stdout. The exit code is 2 when a run ends in `needs_review`.
 
 The first supported workflow controls only an existing, uniquely named
 `Jarvis Cua Smoke ...` test window created by `tests/manual/cua_fixture.ps1`.
@@ -77,3 +80,114 @@ control also stops rather than selecting a different target.
 Run `python tests/manual/calculator_smoke.py` for a pause/restart/repeat smoke
 test. These commands alter the Calculator display and may open Calculator;
 they do not touch files outside the test task database.
+
+## Step contracts and the engine
+
+Workflows are data. Each step is a `StepContract` (`jarvis/tasks/contracts.py`)
+that declares:
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `target` | Step id and a human-readable statement of what it touches |
+| `operation` | `read` (never changes anything) or `mutate` |
+| `observe` | A fresh observation or independent read (window state, file bytes) |
+| `precondition` | Checked on that observation before dispatch; resolves the exact target |
+| `action` | The single dispatch (mutating steps only) |
+| `observe_after`, `postcondition` | How the outcome is re-observed and judged |
+| `timeout` | Seconds for the whole step, enforced with `asyncio.timeout` |
+| `retry` | `reobserve` (read steps), `reconcile`, `adopt_satisfied`; a dispatch is never replayed |
+| `evidence` | Builds the proof recorded for the step |
+
+`TaskRunner` runs every step through the same phases and records the phase in
+each event's `details`:
+
+1. **inspect**: observe and test the postcondition. If it already holds the step
+   is reconciled without acting (`reconciled: true` when a dispatch had been
+   journaled, for example after a crash).
+2. **act**: test the precondition and the budgets, journal `action_intent`
+   (with the attempt) before dispatching, then dispatch once.
+3. **verify**: judge the postcondition on a fresh observation or independent
+   read, record evidence, and advance.
+
+Stops are explicit. A read step whose target is not there yet (the fixture
+window) ends in `paused`. Anything uncertain ends in `needs_review`: an
+unmet precondition, an unverified postcondition, a journaled attempt whose
+postcondition is not observed (no second dispatch), an exception, or a lost
+process. `Plus` in the Calculator workflow sets `reconcile=False` because the
+display cannot prove it, and stays `acknowledged` until the final result
+verifies it.
+
+## Budgets and timeouts
+
+Every task carries `budget = {max_seconds, max_actions}` and progress counters
+`elapsed_seconds`, `actions_taken`, and `started_at`. Defaults come from the
+workflow (fixture: 180 s and 4 actions; Calculator: 300 s and 8 actions). Set
+them at creation with `store.create_fixture(..., budget=Budget(...))` or
+`--max-seconds` / `--max-actions` on `start-*`. `max_seconds` counts time spent
+inside runs, accumulated over resumes, not time spent paused.
+
+Budgets are checked before each step and before each dispatch, never during
+one, so a run stops in `needs_review` with a clear `error` and the in-flight
+action always finishes and is verified first. The overshoot is bounded by one
+step timeout. To continue an exhausted task, raise the caps with
+`resume ID --max-seconds N --max-actions M` (or `store.set_budget`).
+
+A step that exceeds its `timeout` ends differently by kind. A mutating step goes
+to `needs_review` and is never replayed (the action may have landed; resume
+re-observes and reconciles). A read step is re-observed up to `retry.reobserve`
+times and then `paused`.
+
+## Schema and migration
+
+`SCHEMA_VERSION` is 2. Version 1 databases (no budget fields) are upgraded in
+place, inside one transaction, the first time `TaskStore` opens them: each task
+gets its workflow's default budget, `elapsed_seconds = 0`, `actions_taken`
+counted from its `action_intent` events, and a `schema_migrated` event. Task
+`version` numbers, evidence, and journaled attempts are untouched, so a
+migrated task resumes with the same no-replay guarantees. A database written by
+a newer schema is refused rather than modified.
+
+## Adding a workflow
+
+A new workflow needs a `Workflow` of contracts and a creator; the store, runner,
+and `status`/`resume`/`cancel` commands do not change.
+
+```python
+from jarvis.tasks.contracts import Budget, Check, StepContract, TaskSpec, Workflow
+from jarvis.tasks.store import TaskStore
+from jarvis.tasks.workflows import register_workflow
+
+register_workflow(Workflow(
+    name="notepad_note",
+    steps=(
+        StepContract(name="find_window", target="the Notepad window", operation="read",
+                     observe=list_windows, postcondition=exactly_one_window,
+                     evidence=window_evidence, on_unmet="pause"),
+        StepContract(name="type_note", target="the Notepad editor", operation="mutate",
+                     observe=observe_editor, postcondition=editor_has_text,
+                     precondition=resolve_editor, action=type_note,
+                     evidence=lambda ctx, state, phase: {"editor": "matched"},
+                     uncertain="Typing may have reached Notepad; no automatic replay"),
+    ),
+    result="Note typed and verified",
+    budget=Budget(max_seconds=120, max_actions=3),
+    permissions=lambda task: (("desktop_launch", {"name": "Notepad"}),),
+))
+
+
+def note_spec(text: str) -> TaskSpec:
+    return TaskSpec(goal="Type a note in Notepad", scope={"window_title": "Untitled - Notepad"},
+                    input={"text": text})
+
+
+task = TaskStore(path).create("notepad_note", note_spec("hello"))
+```
+
+Callables take a `StepContext` (`ctx.task`, `ctx.scope`, `ctx.input`,
+`ctx.desktop`) and may be plain or `async`. Postconditions and preconditions
+return a `Check`; a precondition passes what it resolved to `action` through
+`Check.handle`. Definitions are validated when constructed (unique lower-snake
+names, positive timeouts, a mutating step needs an action and is never retried,
+the default budget covers the mutating steps), so a bad workflow fails at
+import. Give the task's `permissions` callable the gateway checks the scope must
+pass. Add a `start-*` CLI command only if the workflow needs a shortcut.
