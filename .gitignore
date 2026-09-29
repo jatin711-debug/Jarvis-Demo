@@ -11,9 +11,13 @@ build/
 *.wav
 *.mp3
 .pytest_cache/
+.ruff_cache/
 .mypy_cache/
 
 # Local llama.cpp runtime experiment (binaries + GGUF models, large)
-tools/
+/tools/
 # Benchmark artifacts
 bench_prompt.txt
+
+# Per-machine overrides (extends config.yaml)
+config.local.yaml

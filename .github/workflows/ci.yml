@@ -5,10 +5,15 @@ on:
     branches: [main, master, dev]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -25,16 +30,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      # The unit suite only exercises pure logic (parsing, config, security,
-      # agent loop with a mocked LLM), so we skip the heavy runtime deps
-      # (torch, kokoro, playwright, pyaudio, ...) and install just what the
-      # imported modules need.
+      # A deliberately slim install. The unit suite runs logic with mocked
+      # services, so heavy runtime dependencies (torch, kokoro, playwright,
+      # pyaudio, mem0, ...) are not installed. tests/unit/test_imports.py
+      # enforces that every module imports with only the packages below:
+      # keep this list in sync with ALLOWED_TOP_LEVEL in that file.
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e . --no-deps
-          python -m pip install pytest pytest-asyncio ruff httpx pydantic pyyaml psutil rich numpy soundfile
+          python -m pip install pytest pytest-asyncio ruff httpx pydantic pyyaml psutil numpy soundfile
 
       - name: Lint (ruff)
         run: ruff check .

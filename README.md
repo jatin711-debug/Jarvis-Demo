@@ -48,19 +48,29 @@ The Piper TTS voice model is auto-downloaded to `~/.jarvis/piper_voices/` on fir
 (only when `voice.tts.engine: "piper"`).
 
 ### Configuration
-Edit `config.yaml` to customize wake word, voice settings, model selection, and permissions.
+`config.yaml` holds the safe defaults. Put machine-specific changes (audio device,
+wider permissions) in an untracked `config.local.yaml` that starts with
+`extends: config.yaml`; it is picked up automatically. Pick another file with
+`--config PATH` or `JARVIS_CONFIG`. See [security profiles](docs/security.md#profiles).
 Notable options: `voice.barge_in`, `system.latency_report`, `voice.tts.engine` (`kokoro` or `piper`).
+
+### Logs
+Console output is one readable line per event, tagged with the turn number
+(`jarvis -v` adds DEBUG detail). The full record, always at DEBUG, is in
+`~/.jarvis/logs/jarvis.log`. See [logging](docs/logging.md) for how to read it.
 
 ## Architecture
 
 ```
 jarvis/
-├── core/           # Orchestrator (voice event loop)
-├── voice/          # Wake word, STT, TTS (engine interfaces + implementations)
-├── agent/          # LLM client, ReAct loop, tool registry
+├── core/           # Orchestrator (service startup, voice event loop)
+├── voice/          # Wake word, STT, TTS, audio cues, transcript filters
+├── agent/          # LLM client, ReAct loop, capability router, permission gateway, tool registry
+├── desktop/        # Cua window-scoped desktop backend
+├── tasks/          # Durable task store and resumable workflows (text CLI)
 ├── memory/         # Mem0 integration
 ├── tools/          # System, browser, and vision tools
-└── utils/          # Config loader, logging
+└── utils/          # Config loader, logging, deadlines
 
 tests/
 ├── unit/           # Automated pytest suite (no hardware/services needed)
@@ -87,15 +97,18 @@ The unit suite mocks the LLM and needs no microphone, Ollama, or models.
 The scripts in `tests/manual/` exercise specific live services. The Cua smoke
 needs an interactive Windows desktop but no model or voice devices. See
 [durable task commands](docs/tasks.md), [current permission behavior](docs/security.md),
-and the [roadmap](docs/roadmap.md).
+[how to read the logs](docs/logging.md), the [tool inventory](docs/tools.md)
+(`jarvis --list-tools`), and the [roadmap](docs/roadmap.md).
 
 CI runs pytest + ruff on every push (see `.github/workflows/ci.yml`).
 
 ### Experimental / unreached capabilities
-`ReActAgent.research()` (autonomous web research) and `ReActAgent.computer_use()`
-(see-think-act desktop automation) exist but are not yet wired into the voice loop.
-The HuggingFace provider has decoded-text streaming; complex tool reliability
-still needs end-to-end evaluation.
+`ReActAgent.research()` (autonomous web research) exists but is not wired into the
+voice loop. The HuggingFace provider has decoded-text streaming; complex tool
+reliability still needs end-to-end evaluation. Desktop automation goes through the
+Cua backend and the permission gateway; the earlier screenshot-driven
+`computer_use()` loop was removed because its global typing tools are refused by
+the gateway.
 
 ## License
 MIT

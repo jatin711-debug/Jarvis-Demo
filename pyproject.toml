@@ -34,7 +34,6 @@ dependencies = [
     "openwakeword>=0.6.0",
     # Config & utilities
     "pyyaml>=6.0",
-    "rich>=13.0",
     # System control
     "pyautogui>=0.9.54",
     "psutil>=5.9",
@@ -71,6 +70,7 @@ include = ["jarvis*"]
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 # ================================
 # Ruff

@@ -36,9 +36,11 @@ checks still apply, but approved-scope actions proceed without prompting.
 
 Limitations are important:
 
-- `config.yaml` currently disables confirmations, disables the command
-  whitelist, and permits both drive roots. That is intentionally broad and
-  should be narrowed before unattended or multi-user use.
+- The shipped `config.yaml` is the standard profile (confirmations on, command
+  whitelist on, file access under the home directory). A full-access profile
+  (no confirmations, no whitelist, both drive roots) is a deliberate opt-in; see
+  "Profiles" below. It is intentionally broad and should be narrowed before
+  unattended or multi-user use.
 - The shell command tool remains powerful. Its whitelist rejects shell
   compositions and command interpreters, but it is not a process sandbox.
   Catastrophic patterns are blocked even when the whitelist is disabled.
@@ -52,3 +54,29 @@ Limitations are important:
 - Filesystem path checks are not an OS sandbox and cannot rule out a race if
   another process changes a symlink between checking and use. Direct calls to
   a handler outside the tool registry also bypass the dispatch gateway.
+
+## Profiles
+
+`config.yaml` in the repository is the **standard profile**: writes, commands,
+desktop actions and browser form actions ask for an exact "yes"; shell commands
+must start with an allowed executable; file tools stay under `~`. Catastrophic
+commands are blocked in every profile.
+
+Machine-specific choices go in `config.local.yaml`, which is untracked and is
+loaded automatically ahead of `config.yaml`. It can start from the standard
+profile with `extends:` and override only what differs (mappings merge, lists
+are replaced):
+
+```yaml
+extends: config.yaml
+voice:
+  input_device: 2
+security:
+  allowed_directories: ['~', 'D:\Projects']
+```
+
+A **full-access profile** for a personal machine sets `confirm_dangerous_ops:
+false`, `command_whitelist: false`, empty `allowed_commands`/`blocked_commands`
+and adds the drive roots to `allowed_directories`. Argument validation, scope
+checks and the catastrophic-command block still run. Use `jarvis --config PATH`
+or `JARVIS_CONFIG` to select a specific file.

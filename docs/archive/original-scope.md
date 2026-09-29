@@ -3,7 +3,7 @@
 > **⚠️ Historical planning document (v2.0).** This was the original scope spec.
 > The implementation has since pivoted (no FastAPI/Celery/Redis/LangChain,
 > OpenWakeWord instead of Porcupine, Kokoro/Piper instead of XTTS, Qwen models
-> instead of Llama 3.1). **See `README.md` for the current architecture and stack.**
+> instead of Llama 3.1). **See the top-level `README.md` for the current architecture and stack.**
 
 ## 🎯 **Mission Statement**
 

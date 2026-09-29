@@ -20,7 +20,6 @@ from pydantic import BaseModel, Field
 
 class SystemConfig(BaseModel):
     name: str = "Jarvis"
-    debug: bool = False
     log_level: str = "INFO"
     log_dir: str = "~/.jarvis/logs"
     data_dir: str = "~/.jarvis"
@@ -135,6 +134,7 @@ class JarvisConfig(BaseModel):
 # ──────────────────────────────────────────────
 
 _CONFIG_SEARCH_PATHS = [
+    Path("config.local.yaml"),  # untracked, per-machine overrides
     Path("config.yaml"),
     Path("config.yml"),
     Path.home() / ".jarvis" / "config.yaml",
@@ -142,7 +142,7 @@ _CONFIG_SEARCH_PATHS = [
 
 
 def _find_config_file() -> Path | None:
-    """Search for config.yaml in standard locations."""
+    """Search for a config file in standard locations."""
     # Check env var first
     env_path = os.environ.get("JARVIS_CONFIG")
     if env_path:
@@ -154,6 +154,42 @@ def _find_config_file() -> Path | None:
     return None
 
 
+def resolve_config_path(config_path: str | Path | None = None) -> Path | None:
+    """The file `load_config` would read, or None when defaults apply."""
+    if config_path:
+        return expand_path(str(config_path))
+    return _find_config_file()
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge mappings recursively; any other value (lists included) is replaced."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_layers(path: Path, chain: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Read ``path``, first applying the file named by its top-level ``extends`` key."""
+    path = path.resolve()
+    if path in chain:
+        raise ValueError(f"Config 'extends' cycle: {' -> '.join(str(p) for p in (*chain, path))}")
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config {path} must be a mapping at the top level")
+    parent = raw.pop("extends", None)
+    if parent is None:
+        return raw
+    if not isinstance(parent, str):
+        raise ValueError(f"'extends' in {path} must be a file path")
+    base = _read_layers(path.parent / os.path.expanduser(os.path.expandvars(parent)), (*chain, path))
+    return _deep_merge(base, raw)
+
+
 def load_config(config_path: str | Path | None = None) -> JarvisConfig:
     """
     Load JARVIS configuration.
@@ -161,24 +197,17 @@ def load_config(config_path: str | Path | None = None) -> JarvisConfig:
     Priority:
     1. Explicit path argument
     2. JARVIS_CONFIG environment variable
-    3. ./config.yaml
+    3. ./config.local.yaml, ./config.yaml, ./config.yml
     4. ~/.jarvis/config.yaml
     5. Pure defaults
+
+    A file may start from another with ``extends: path/to/base.yaml``
+    (relative to the file); its own keys are merged over the base.
     """
-    path: Path | None = None
-
-    if config_path:
-        path = expand_path(str(config_path))
-    else:
-        path = _find_config_file()
-
-    if path is not None:
-        with open(path, encoding="utf-8") as f:
-            raw: dict[str, Any] = yaml.safe_load(f) or {}
-        return JarvisConfig.model_validate(raw)
-
-    # No config file found — use defaults
-    return JarvisConfig()
+    path = resolve_config_path(config_path)
+    if path is None:
+        return JarvisConfig()
+    return JarvisConfig.model_validate(_read_layers(path))
 
 
 def expand_path(path_str: str) -> Path:

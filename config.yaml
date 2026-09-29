@@ -1,53 +1,61 @@
 # ================================
-# JARVIS Configuration — Voice-Only
+# JARVIS configuration (safe defaults)
 # ================================
+# Per-machine changes belong in config.local.yaml (untracked). It is picked up
+# automatically and can start from this file:
+#
+#   extends: config.yaml
+#   voice:
+#     input_device: 2
+#
+# See docs/security.md before widening the `security` section.
 
 desktop:
-  backend: cua                # Install pip install -e ".[desktop]"; legacy disables Cua
-  delivery_mode: background   # Never silently switch to foreground input
+  backend: cua                # pip install -e ".[desktop]"; "legacy" disables Cua
+  delivery_mode: background   # never silently switch to foreground input
   telemetry: false
   update_check: false
 
 system:
   name: "Jarvis"
-  debug: true
-  log_level: "DEBUG"           # DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"            # console level: DEBUG, INFO, WARNING, ERROR (the log file always records DEBUG)
   log_dir: "~/.jarvis/logs"
   data_dir: "~/.jarvis"
-  latency_report: true         # Log per-turn timing breakdown (record/STT/LLM/TTS)
+  latency_report: true         # one "latency ..." line per spoken turn
 
-# --- Voice Pipeline ---
+# --- Voice pipeline ---
 voice:
   wake_word: "hey_jarvis"     # OpenWakeWord model name
-  sensitivity: 0.4            # Lowered for easier detection
-  input_device: 2              # JBL Tune 520BT (use null for system default)
+  sensitivity: 0.4
+  input_device: null           # null = system default; set an index in config.local.yaml
   output_device: null          # null = system default
-  barge_in: true               # Let the user interrupt Jarvis mid-response by speaking
+  barge_in: true               # let the user interrupt Jarvis mid-response by speaking
 
   stt:
-    model: "distil-small.en"   # Distilled Whisper: 2-4x faster, same accuracy
+    model: "distil-small.en"   # distilled Whisper: 2-4x faster, same accuracy
     language: "en"
     beam_size: 1               # 1 = greedy (fast), 5 = beam search (slower)
     compute_type: "int8"       # int8 for CPU, float16 for GPU
 
   tts:
-    engine: "kokoro"         # piper (ultra-fast ~150ms) or kokoro (high quality)
-    voice: "am_michael"      # Kokoro voice preset (ignored when engine=piper)
+    engine: "kokoro"           # kokoro (high quality) or piper (~150ms)
+    voice: "am_michael"        # Kokoro voice preset (ignored when engine=piper)
     speed: 1.0
     sample_rate: 24000
-    piper_model: "en_US-lessac-medium.onnx"  # Piper ONNX voice model
-# --- LLM (Multi-backend support) ---
+    piper_model: "en_US-lessac-medium.onnx"
+
+# --- LLM ---
 llm:
-  provider: "ollama"        # "ollama" or "huggingface"
-  model: "qwen3.5:2b"      # Q8_0, fits 4GB VRAM fully; vision+tools capable
-  base_url: "http://localhost:11434"  # Ollama default port
-  max_tokens: 512              # short voice responses
-  first_response_timeout: 30   # Stop silent model waits; do not retry this deadline
-  temperature: 0.1            # LFM recommended (also works for Qwen)
+  provider: "ollama"          # "ollama" or "huggingface"
+  model: "qwen3.5:2b"         # Q8_0, fits 4GB VRAM fully; vision+tools capable
+  base_url: "http://localhost:11434"
+  max_tokens: 512             # short voice responses
+  first_response_timeout: 30  # stop silent model waits; this deadline is not retried
+  temperature: 0.1
   top_p: 0.9
-  top_k: 50                   # LFM recommended
-  repetition_penalty: 1.05     # LFM recommended
-  context_window: 4096        # Minimal context for speed
+  top_k: 50
+  repetition_penalty: 1.05
+  context_window: 4096        # minimal context for speed
   system_prompt: |
     You are Jarvis, a voice-controlled AI assistant with access to configured
     tools on the user's Windows system. Tool permissions still apply.
@@ -72,13 +80,14 @@ memory:
     collection_name: "jarvis_memories"
     path: "~/.jarvis/vectors"
 
-# --- Security (unrestricted for full admin access) ---
+# --- Security ---
+# Standard profile: mutating actions ask for an explicit "yes", shell commands
+# must start with an allowed executable, and file access stays under the home
+# directory. Catastrophic commands (format, diskpart, rm -rf /, ...) are always blocked.
 security:
-  confirm_dangerous_ops: false
-  command_whitelist: false
-  allowed_commands: []
-  blocked_commands: []
+  confirm_dangerous_ops: true
+  command_whitelist: true
+  allowed_commands: [git, echo, dir, type, ping, ipconfig, systeminfo, tasklist, notepad, calc, explorer, code]
+  blocked_commands: [rm -rf, format, del /s, shutdown, restart]
   allowed_directories:
     - "~"
-    - "C:\\"
-    - "D:\\"

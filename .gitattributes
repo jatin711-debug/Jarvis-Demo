@@ -1,0 +1,6 @@
+# Normalize line endings in the repository; the working tree follows the platform.
+* text=auto
+*.ps1 text eol=crlf
+*.png binary
+*.wav binary
+*.mp3 binary

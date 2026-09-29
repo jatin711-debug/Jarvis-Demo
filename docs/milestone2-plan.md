@@ -29,7 +29,8 @@ authorization boundary. Work proceeds in these slices:
    destination, and uncertain-dispatch scenarios. Run unit/lint and live GUI
    smoke separately; report verified outcomes and unresolved uncertainty.
 
-The existing `config.yaml` explicitly disables confirmations and permits
-both drive roots. The gateway will honor that choice while enforcing any
-narrower scopes a deployment config specifies. That profile is not a
-production-safe default; tightening it is a separate user choice.
+The gateway honors whatever profile the config selects while enforcing any
+narrower scopes it specifies. The repository `config.yaml` is now the standard
+profile (confirmations on, whitelist on, home directory only); a full-access
+profile is an explicit per-machine opt-in in `config.local.yaml`. See
+[security](security.md#profiles).
