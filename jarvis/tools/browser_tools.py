@@ -56,7 +56,7 @@ class BrowserSession:
             ),
         )
         self._page = await self._context.new_page()
-        logger.info("🌐 Browser launched")
+        logger.info("browser launched")
 
     @property
     def page(self) -> Any:
@@ -64,6 +64,7 @@ class BrowserSession:
 
     async def shutdown(self) -> None:
         """Close browser and clean up."""
+        was_open = self._playwright is not None
         try:
             if self._context:
                 await self._context.close()
@@ -71,13 +72,14 @@ class BrowserSession:
                 await self._browser.close()
             if self._playwright:
                 await self._playwright.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("browser cleanup failed error=%s", e)
         self._page = None
         self._context = None
         self._browser = None
         self._playwright = None
-        logger.info("🌐 Browser closed")
+        if was_open:
+            logger.info("browser closed")
 
 
 # Module-level singleton so all tools share the same session
@@ -117,9 +119,9 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             response = await _session.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             title = await _session.page.title()
             status = response.status if response else "unknown"
-            return f"✅ Navigated to: {title}\nURL: {_session.page.url}\nStatus: {status}"
+            return f"Navigated to: {title}\nURL: {_session.page.url}\nStatus: {status}"
         except Exception as e:
-            return f"❌ Navigation failed: {e}"
+            return f"Navigation failed: {e}"
 
     # ── Google Search ──
 
@@ -176,10 +178,10 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                     continue
 
             if results:
-                return f"🔍 Google results for '{query}':\n\n" + "\n\n".join(results)
-            return f"🔍 Searched for '{query}' but couldn't parse results. Page: {page.url}"
+                return f"Google results for '{query}':\n\n" + "\n\n".join(results)
+            return f"Searched for '{query}' but couldn't parse results. Page: {page.url}"
         except Exception as e:
-            return f"❌ Search failed: {e}"
+            return f"Search failed: {e}"
 
     # ── Click Element ──
 
@@ -206,7 +208,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_click(selector: str) -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
             # Try as text first, then as CSS selector
@@ -215,7 +217,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 await el.click(timeout=5000)
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
                 title = await page.title()
-                return f"✅ Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
+                return f"Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
 
             # Try as role-based
             el = page.get_by_role("link", name=selector).first
@@ -223,22 +225,22 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 await el.click(timeout=5000)
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
                 title = await page.title()
-                return f"✅ Clicked link '{selector}'\nPage: {title}\nURL: {page.url}"
+                return f"Clicked link '{selector}'\nPage: {title}\nURL: {page.url}"
 
             el = page.get_by_role("button", name=selector).first
             if await el.count() > 0 and await el.is_visible():
                 await el.click(timeout=5000)
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
                 title = await page.title()
-                return f"✅ Clicked button '{selector}'\nPage: {title}\nURL: {page.url}"
+                return f"Clicked button '{selector}'\nPage: {title}\nURL: {page.url}"
 
             # Fall through to CSS selector
             await page.click(selector, timeout=5000)
             await page.wait_for_load_state("domcontentloaded", timeout=10000)
             title = await page.title()
-            return f"✅ Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
+            return f"Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
         except Exception as e:
-            return f"❌ Click failed for '{selector}': {e}"
+            return f"Click failed for '{selector}': {e}"
 
     # ── Type / Fill Text ──
 
@@ -273,7 +275,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_type(selector: str, text: str, press_enter: bool = False) -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
 
@@ -285,7 +287,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 if press_enter:
                     await el.press("Enter")
                     await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return f"✅ Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
+                return f"Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
 
             # Try as label
             el = page.get_by_label(selector, exact=False).first
@@ -295,16 +297,16 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 if press_enter:
                     await el.press("Enter")
                     await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return f"✅ Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
+                return f"Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
 
             # Fall through to CSS selector
             await page.fill(selector, text, timeout=5000)
             if press_enter:
                 await page.press(selector, "Enter")
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            return f"✅ Typed '{text}' into '{selector}'" + (" and pressed Enter" if press_enter else "")
+            return f"Typed '{text}' into '{selector}'" + (" and pressed Enter" if press_enter else "")
         except Exception as e:
-            return f"❌ Type failed for '{selector}': {e}"
+            return f"Type failed for '{selector}': {e}"
 
     # ── Read Page Content ──
 
@@ -327,7 +329,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_read_page(selector: str = "") -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
             title = await page.title()
@@ -343,9 +345,9 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             if len(text) > 5000:
                 text = text[:5000] + f"\n\n... (truncated, {len(text)} total chars)"
 
-            return f"📄 Page: {title}\nURL: {url}\n\n{text}"
+            return f"Page: {title}\nURL: {url}\n\n{text}"
         except Exception as e:
-            return f"❌ Failed to read page: {e}"
+            return f"Failed to read page: {e}"
 
     # ── Scroll ──
 
@@ -369,15 +371,15 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_scroll(direction: str, amount: int = 500) -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
             delta = amount if direction.lower() == "down" else -amount
             await page.mouse.wheel(0, delta)
             await asyncio.sleep(0.3)  # let page settle
-            return f"✅ Scrolled {direction} by {amount}px"
+            return f"Scrolled {direction} by {amount}px"
         except Exception as e:
-            return f"❌ Scroll failed: {e}"
+            return f"Scroll failed: {e}"
 
     # ── Get Page Info ──
 
@@ -388,7 +390,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_get_info() -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
             title = await page.title()
@@ -418,22 +420,22 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                     }));
             }""")
 
-            result = f"📄 Page: {title}\nURL: {url}\n"
+            result = f"Page: {title}\nURL: {url}\n"
 
             if links_info:
-                result += f"\n🔗 Links ({len(links_info)}):\n"
+                result += f"\nLinks ({len(links_info)}):\n"
                 for i, link in enumerate(links_info, 1):
-                    result += f"  {i}. {link['text']} → {link['href']}\n"
+                    result += f"  {i}. {link['text']} -> {link['href']}\n"
 
             if inputs_info:
-                result += f"\n📝 Input fields ({len(inputs_info)}):\n"
+                result += f"\nInput fields ({len(inputs_info)}):\n"
                 for inp in inputs_info:
                     ident = inp['placeholder'] or inp['name'] or inp['id'] or inp['type']
                     result += f"  - <{inp['tag']}> type={inp['type']} ({ident})\n"
 
             return result
         except Exception as e:
-            return f"❌ Failed to get page info: {e}"
+            return f"Failed to get page info: {e}"
 
     # ── Browser Screenshot ──
 
@@ -456,16 +458,16 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_screenshot(save_path: str = "", full_page: bool = False) -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             if not save_path:
                 save_dir = Path.home() / ".jarvis"
                 save_dir.mkdir(parents=True, exist_ok=True)
                 save_path = str(save_dir / "browser_screenshot.png")
             await _session.page.screenshot(path=save_path, full_page=full_page)
-            return f"✅ Browser screenshot saved to {save_path}"
+            return f"Browser screenshot saved to {save_path}"
         except Exception as e:
-            return f"❌ Screenshot failed: {e}"
+            return f"Screenshot failed: {e}"
 
     # ── Back / Forward ──
 
@@ -476,13 +478,13 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_back() -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             await _session.page.go_back(wait_until="domcontentloaded", timeout=10000)
             title = await _session.page.title()
-            return f"✅ Went back → {title}\nURL: {_session.page.url}"
+            return f"Went back -> {title}\nURL: {_session.page.url}"
         except Exception as e:
-            return f"❌ Back navigation failed: {e}"
+            return f"Back navigation failed: {e}"
 
     @registry.tool(
         name="browser_forward",
@@ -491,13 +493,13 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_forward() -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             await _session.page.go_forward(wait_until="domcontentloaded", timeout=10000)
             title = await _session.page.title()
-            return f"✅ Went forward → {title}\nURL: {_session.page.url}"
+            return f"Went forward -> {title}\nURL: {_session.page.url}"
         except Exception as e:
-            return f"❌ Forward navigation failed: {e}"
+            return f"Forward navigation failed: {e}"
 
     # ── Tab Management ──
 
@@ -516,17 +518,17 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_new_tab(url: str = "") -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             new_page = await _session._context.new_page()
             _session._page = new_page
             if url:
                 await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 title = await new_page.title()
-                return f"✅ New tab opened: {title}\nURL: {new_page.url}"
-            return "✅ New blank tab opened"
+                return f"New tab opened: {title}\nURL: {new_page.url}"
+            return "New blank tab opened"
         except Exception as e:
-            return f"❌ Failed to open new tab: {e}"
+            return f"Failed to open new tab: {e}"
 
     @registry.tool(
         name="browser_list_tabs",
@@ -535,7 +537,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_list_tabs() -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             pages = _session._context.pages
             lines = []
@@ -543,9 +545,9 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 active = " (active)" if p == _session.page else ""
                 title = await p.title()
                 lines.append(f"  {i+1}. {title} — {p.url}{active}")
-            return f"🗂️ Open tabs ({len(pages)}):\n" + "\n".join(lines)
+            return f"Open tabs ({len(pages)}):\n" + "\n".join(lines)
         except Exception as e:
-            return f"❌ Failed to list tabs: {e}"
+            return f"Failed to list tabs: {e}"
 
     @registry.tool(
         name="browser_switch_tab",
@@ -563,18 +565,18 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_switch_tab(tab_number: int) -> str:
         if not _session.is_running:
-            return "❌ Browser not open. Use browser_navigate first."
+            return "Browser not open. Use browser_navigate first."
         try:
             pages = _session._context.pages
             idx = tab_number - 1
             if idx < 0 or idx >= len(pages):
-                return f"❌ Invalid tab number. Have {len(pages)} tabs."
+                return f"Invalid tab number. Have {len(pages)} tabs."
             _session._page = pages[idx]
             await _session._page.bring_to_front()
             title = await _session._page.title()
-            return f"✅ Switched to tab {tab_number}: {title}\nURL: {_session._page.url}"
+            return f"Switched to tab {tab_number}: {title}\nURL: {_session._page.url}"
         except Exception as e:
-            return f"❌ Failed to switch tab: {e}"
+            return f"Failed to switch tab: {e}"
 
     # ── Close Browser ──
 
@@ -586,9 +588,9 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     async def browser_close() -> str:
         try:
             await _session.shutdown()
-            return "✅ Browser closed"
+            return "Browser closed"
         except Exception as e:
-            return f"❌ Failed to close browser: {e}"
+            return f"Failed to close browser: {e}"
 
     # ── YouTube Search (convenience) ──
 
@@ -640,4 +642,4 @@ def register_browser_tools(registry: ToolRegistry) -> None:
         except Exception as e:
             return f"YouTube search failed: {e}"
 
-    logger.info("Registered %d browser tools", 15)
+    logger.debug("browser tools registered count=%d", len(registry))

@@ -62,7 +62,7 @@ def _get_mic_native_rate(device_index: int | None = None) -> int:
             info = pa.get_device_info_by_index(device_index)
         else:
             info = pa.get_default_input_device_info()
-        logger.debug("🎤 Using input device [%d] %s", info["index"], info["name"])
+        logger.debug("input device index=%d name=%s", info["index"], info["name"])
         return int(info.get("defaultSampleRate", 44100))
     finally:
         pa.terminate()
@@ -91,7 +91,7 @@ def _validate_mic(device_index: int | None, sample_rate: int, duration: float = 
         stream.close()
         return peak_rms > 5.0
     except Exception as e:
-        logger.warning("🎤 Mic validation failed for device %s: %s", device_index, e)
+        logger.warning("mic validation failed device=%s error=%s", device_index, e)
         return False
     finally:
         pa.terminate()
@@ -158,15 +158,15 @@ class _GaplessPlayer:
         if self._stream is not None and not self._stream.closed:
             try:
                 self._stream.abort()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("audio stream abort failed error=%s", e)
 
     def close(self) -> None:
         if self._stream is not None:
             try:
                 self._stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("audio stream close failed error=%s", e)
             self._stream = None
             self._written = 0.0
 
@@ -198,7 +198,7 @@ class KokoroTTS(TTSEngine):
             return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
 
         self._pipeline = await loop.run_in_executor(None, _init_kokoro)
-        logger.info("🔊 Kokoro TTS ready (voice=%s, speed=%.1f)", self.voice, self.speed)
+        logger.info("tts ready engine=kokoro voice=%s speed=%.1f", self.voice, self.speed)
 
     async def shutdown(self) -> None:
         self._pipeline = None
@@ -283,7 +283,7 @@ class PiperTTS(TTSEngine):
         self._voice = await loop.run_in_executor(None, _load)
         self.sample_rate = self._voice.config.sample_rate
         logger.info(
-            "🔊 Piper TTS ready (model=%s, sr=%d)",
+            "tts ready engine=piper model=%s sample_rate=%d",
             os.path.basename(self._model_path), self.sample_rate,
         )
 
@@ -314,7 +314,7 @@ class PiperTTS(TTSEngine):
         )
         os.makedirs(os.path.dirname(self._model_path), exist_ok=True)
 
-        logger.info("⬇️  Downloading Piper voice %s ...", filename)
+        logger.info("downloading piper voice file=%s", filename)
         try:
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=httpx.Timeout(300.0, connect=15.0),
@@ -328,7 +328,7 @@ class PiperTTS(TTSEngine):
                     resp.raise_for_status()
                     with open(dest, "wb") as f:
                         f.write(resp.content)
-                    logger.info("   saved %s (%d bytes)", dest, len(resp.content))
+                    logger.info("piper voice saved path=%s bytes=%d", dest, len(resp.content))
         except Exception as e:
             # Clean up partial downloads so a retry isn't confused
             for partial in (self._model_path, self._model_path + ".json"):
@@ -416,7 +416,7 @@ class WhisperSTT(STTEngine):
                 self.model_size, device="cpu", compute_type=self.compute_type
             ),
         )
-        logger.info("📝 Whisper STT ready (model=%s, compute=%s)", self.model_size, self.compute_type)
+        logger.info("stt ready engine=whisper model=%s compute=%s", self.model_size, self.compute_type)
 
     async def shutdown(self) -> None:
         self._model = None
@@ -493,26 +493,25 @@ class OpenWakeWordEngine(WakeWordEngine):
 
         # Detect mic native sample rate
         self._native_sr = _get_mic_native_rate(self.input_device)
-        logger.info("🎤 Mic native sample rate: %d Hz", self._native_sr)
+        logger.debug("mic native sample rate=%dHz", self._native_sr)
 
         # Quick mic health check at startup
         if not _validate_mic(self.input_device, self._native_sr):
             logger.warning(
-                "⚠️  Mic device %s appears SILENT (Level ≈ 0). "
-                "Check: Windows mic privacy settings, mute switch, "
-                "or set 'input_device' in config.yaml to a working device index.",
-                self.input_device if self.input_device is not None else "(default)",
+                "mic appears silent device=%s; check Windows microphone privacy settings, "
+                "the mute switch, or set voice.input_device in config.yaml",
+                self.input_device if self.input_device is not None else "default",
             )
             # List available input devices to help the user
             import pyaudio
             pa = pyaudio.PyAudio()
             try:
-                logger.info("🎤 Available input devices:")
+                logger.info("available input devices:")
                 for i in range(pa.get_device_count()):
                     info = pa.get_device_info_by_index(i)
                     if info["maxInputChannels"] > 0:
                         logger.info(
-                            "    [%d] %s (ch=%d, rate=%d)",
+                            "  input device index=%d name=%s channels=%d rate=%d",
                             i, info["name"], info["maxInputChannels"],
                             int(info["defaultSampleRate"]),
                         )
@@ -527,7 +526,7 @@ class OpenWakeWordEngine(WakeWordEngine):
                 inference_framework="onnx",
             ),
         )
-        logger.info("👂 OpenWakeWord ready (model=%s, ONNX)", self.wake_word)
+        logger.info("wake word ready engine=openwakeword model=%s", self.wake_word)
 
     async def shutdown(self) -> None:
         self._running = False
@@ -535,8 +534,8 @@ class OpenWakeWordEngine(WakeWordEngine):
             try:
                 self._stream.stop_stream()
                 self._stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("mic stream close failed error=%s", e)
             self._stream = None
         if self._pyaudio:
             self._pyaudio.terminate()
@@ -567,7 +566,7 @@ class OpenWakeWordEngine(WakeWordEngine):
         self._running = True
 
         loop = asyncio.get_event_loop()
-        logger.info("🎙️ Listening for wake word '%s'...", self.wake_word)
+        logger.debug("wake word loop started model=%s", self.wake_word)
 
         try:
             while self._running:
@@ -602,10 +601,10 @@ class OpenWakeWordEngine(WakeWordEngine):
                 # Debug: log score every ~5 seconds (62 frames at 80ms each)
                 self._frame_count += 1
                 if self._frame_count % 62 == 0:
-                    logger.info("🎙️ Mic Alive | Level: %4.0f | Wake Score: %.4f", rms, score)
+                    logger.debug("mic alive level=%.0f wake_score=%.4f", rms, score)
 
                 if score >= self.sensitivity:
-                    logger.info("🔔 Wake word detected! (score=%.3f)", score)
+                    logger.debug("wake word score=%.3f", score)
                     self._frame_count = 0
                     yield True
                 else:
@@ -688,9 +687,9 @@ async def record_until_silence(
         silence_threshold = ambient_rms * 3.0
         # Ensure a reasonable minimum so we don't get stuck on very quiet mics
         silence_threshold = max(silence_threshold, 30.0)
-        logger.debug("Auto-calibrated silence threshold: %.0f (ambient=%.0f)", silence_threshold, ambient_rms)
+        logger.debug("silence threshold calibrated threshold=%.0f ambient=%.0f", silence_threshold, ambient_rms)
 
-    logger.debug("Recording at %d Hz, resampling to %d Hz, silence_thresh=%.0f", native_sr, sample_rate, silence_threshold)
+    logger.debug("recording native_rate=%dHz target_rate=%dHz silence_threshold=%.0f", native_sr, sample_rate, silence_threshold)
 
     try:
         for _ in range(max_chunks):
@@ -784,9 +783,7 @@ async def wait_for_speech(
             levels.append(float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))))
         baseline = max(float(np.mean(levels)), 1.0)
         threshold = max(baseline * threshold_factor, 100.0)
-        logger.debug(
-            "Barge-in monitor: baseline=%.0f threshold=%.0f", baseline, threshold,
-        )
+        logger.debug("barge-in monitor baseline=%.0f threshold=%.0f", baseline, threshold)
 
         sustain_chunks = max(int(sustain_ms / chunk_ms), 1)
         max_chunks = int(max_duration * sample_rate / 1024)
@@ -803,7 +800,7 @@ async def wait_for_speech(
 
             loud_chunks = loud_chunks + 1 if rms > threshold else 0
             if loud_chunks >= sustain_chunks:
-                logger.debug("Barge-in: sustained speech detected (rms=%.0f)", rms)
+                logger.debug("barge-in speech detected rms=%.0f", rms)
                 return True
         return False
     finally:

@@ -17,7 +17,7 @@ async def test_wakeword():
         import pyaudio
         from openwakeword.model import Model
     except ImportError as e:
-        print(f"❌ Missing dependency: {e}")
+        print(f"Missing dependency: {e}")
         return
 
     try:
@@ -26,10 +26,10 @@ async def test_wakeword():
             wakeword_models=[target_ww],
             inference_framework="onnx"
         )
-        print("✅ OpenWakeWord model loaded successfully (ONNX).")
+        print("OpenWakeWord model loaded successfully (ONNX).")
         print(f"   Loaded models: {list(owwModel.models.keys())}")
     except Exception as e:
-        print(f"❌ Failed to load OpenWakeWord model: {e}")
+        print(f"Failed to load OpenWakeWord model: {e}")
         return
 
     print("\n2. Checking PyAudio device availability...")
@@ -40,9 +40,9 @@ async def test_wakeword():
         print(f"  Sample rate: {int(info.get('defaultSampleRate', 0))} Hz")
         print(f"  Input channels: {info.get('maxInputChannels', 0)}")
         audio.terminate()
-        print("✅ PyAudio initialized — microphone detected.")
+        print("PyAudio initialized — microphone detected.")
     except Exception as e:
-        print(f"  ⚠️ PyAudio issue (expected if no mic): {e}")
+        print(f"  PyAudio issue (expected if no mic): {e}")
 
     # Quick functional test: feed silence and verify no false-positive
     print("\n3. Running false-positive test (feeding 1s of silence)...")
@@ -53,11 +53,11 @@ async def test_wakeword():
     print(f"  Scores on silence: {scores}")
     print(f"  Max score: {max_score:.4f} (should be ~0)")
     if max_score < 0.1:
-        print("✅ No false positive on silence.")
+        print("No false positive on silence.")
     else:
-        print("⚠️ Unexpected high score on silence!")
+        print("Unexpected high score on silence!")
 
-    print("\n✅ Wake word test complete! System is ready to listen.")
+    print("\nWake word test complete! System is ready to listen.")
 
 if __name__ == "__main__":
     asyncio.run(test_wakeword())

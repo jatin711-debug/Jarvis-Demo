@@ -1,4 +1,5 @@
 """Bound a wait while reporting progress without logging request contents."""
+
 import asyncio
 
 from jarvis.utils.logger import get_logger
@@ -19,7 +20,7 @@ async def wait_with_progress(awaitable, timeout: float, label: str):
             if done:
                 return task.result()
             if loop.time() < deadline:
-                logger.info("Still waiting for %s (%.0fs remaining)", label, deadline - loop.time())
+                logger.info("still waiting for %s remaining=%.0fs", label, deadline - loop.time())
     finally:
         if not task.done():
             task.cancel()

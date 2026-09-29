@@ -19,7 +19,7 @@ async def test_memory():
     await manager.startup()
 
     if not manager._memory:
-        print("❌ Mem0 failed to initialize")
+        print("Mem0 failed to initialize")
         return
 
     print("2. Adding memories...")
@@ -58,7 +58,7 @@ async def test_memory():
         print(f"  {i}. {mem_text}")
 
     await manager.shutdown()
-    print("\n✅ Memory test complete!")
+    print("\nMemory test complete!")
 
 if __name__ == "__main__":
     asyncio.run(test_memory())

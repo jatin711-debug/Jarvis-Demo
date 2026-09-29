@@ -15,6 +15,9 @@ from typing import Any
 
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.config import DesktopConfig
+from jarvis.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class CuaDesktop:
@@ -42,6 +45,8 @@ class CuaDesktop:
                 metadata = await self._driver.metadata()
             if metadata.driver_version != "0.28.2":
                 raise RuntimeError("Jarvis requires cua-driver==0.28.2; reinstall the desktop extra.")
+            logger.info("desktop ready backend=cua version=%s delivery=%s",
+                        metadata.driver_version, self.config.delivery_mode)
         except BaseException:
             await self.shutdown()
             raise
@@ -60,6 +65,7 @@ class CuaDesktop:
             raise RuntimeError("Desktop backend is not running")
         if self._uncertain:
             raise RuntimeError("A desktop call was interrupted; restart Jarvis before more desktop actions")
+        started = time.monotonic()
         try:
             async with asyncio.timeout(self.config.timeout):
                 result = await self._driver.call_tool(name, json.dumps(args))
@@ -68,8 +74,13 @@ class CuaDesktop:
             # allow another call to race it after cancellation.
             self._uncertain = True
             self._snapshots.clear()
+            logger.error("desktop call interrupted name=%s after=%.1fs; blocking further desktop "
+                         "actions until restart", name, time.monotonic() - started)
             raise
+        logger.debug("desktop call name=%s ms=%.0f error=%s", name,
+                     (time.monotonic() - started) * 1000, result.is_error)
         if result.is_error:
+            logger.warning("desktop call refused name=%s code=%s", name, result.error_code or "")
             raise RuntimeError(f"Cua refused {name}: {result.error_code or ''} {result.text}")
         if result.structured_json:
             data = json.loads(result.structured_json)

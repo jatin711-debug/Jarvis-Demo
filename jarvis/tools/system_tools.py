@@ -8,10 +8,9 @@ Dispatch is subject to the configured permission gateway.
 from __future__ import annotations
 
 import asyncio
-import os
 import ntpath
+import os
 import platform
-import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta
@@ -20,8 +19,8 @@ from typing import Any
 
 import psutil
 
-from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.agent.permissions import catastrophic_reason as _catastrophic_reason
+from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.config import SecurityConfig
 from jarvis.utils.logger import get_logger
 
@@ -50,19 +49,19 @@ def register_system_tools(
         """Security gate for run_command. Returns refusal reason or None."""
         reason = _catastrophic_reason(command)
         if reason:
-            return f"❌ Blocked: this command {reason}. Run it manually if you really mean it."
+            return f"Blocked: this command {reason}. Run it manually if you really mean it."
 
         lowered = command.lower()
         for blocked in security.blocked_commands:
             if blocked and blocked.lower() in lowered:
-                return f"❌ Blocked by config blocklist: '{blocked}'"
+                return f"Blocked by config blocklist: '{blocked}'"
 
         if security.command_whitelist:
             exe = _first_executable(command)
             allowed = {a.lower() for a in security.allowed_commands}
             if exe not in allowed:
                 return (
-                    f"❌ '{exe}' is not in the command whitelist. "
+                    f"'{exe}' is not in the command whitelist. "
                     "Add it to security.allowed_commands in config.yaml to allow it."
                 )
         return None
@@ -87,7 +86,7 @@ def register_system_tools(
     async def run_command(command: str) -> str:
         refusal = _command_allowed(command)
         if refusal:
-            logger.warning("run_command blocked: %s | %s", command, refusal)
+            logger.warning("command blocked command=%r reason=%s", command, refusal)
             return refusal
         try:
             result = await asyncio.create_subprocess_shell(
@@ -104,9 +103,9 @@ def register_system_tools(
                 output += f"\n[stderr]: {errors}"
             return output or "(no output)"
         except TimeoutError:
-            return "❌ Command timed out after 120 seconds."
+            return "Command timed out after 120 seconds."
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     # ── App name aliases (shared by open_application and type_text) ──
     _WIN_ALIASES: dict[str, str] = {
@@ -215,8 +214,8 @@ def register_system_tools(
                                     continue
                 except OSError:
                     continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("app path registry lookup failed error=%s", e)
 
         return None
 
@@ -264,19 +263,19 @@ def register_system_tools(
                 resolved = _resolve_app_windows(app_name)
                 if resolved is None:
                     return (
-                        f"❌ Could not find an application named '{app_name}'. "
+                        f"Could not find an application named '{app_name}'. "
                         "It may not be installed, or may need its full path."
                     )
                 _launch_windows(resolved)
-                return f"✅ Launched '{app_name}' (via {resolved})"
+                return f"Launched '{app_name}' (via {resolved})"
             subprocess.Popen(
                 [app_name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return f"✅ Launched '{app_name}'"
+            return f"Launched '{app_name}'"
         except Exception as e:
-            return f"❌ Failed to launch '{app_name}': {e}"
+            return f"Failed to launch '{app_name}': {e}"
 
     # ── File Read ──
 
@@ -297,16 +296,16 @@ def register_system_tools(
     async def read_file(file_path: str) -> str:
         path = Path(file_path).expanduser().resolve()
         if not path.exists():
-            return f"❌ File not found: {path}"
+            return f"File not found: {path}"
         if not path.is_file():
-            return f"❌ Not a file: {path}"
+            return f"Not a file: {path}"
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
             if len(content) > 50000:
                 return content[:50000] + f"\n\n... (truncated, {len(content)} total chars)"
             return content
         except Exception as e:
-            return f"❌ Error reading file: {e}"
+            return f"Error reading file: {e}"
 
     # ── File Write ──
 
@@ -333,9 +332,9 @@ def register_system_tools(
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return f"✅ Written {len(content)} chars to {path}"
+            return f"Written {len(content)} chars to {path}"
         except Exception as e:
-            return f"❌ Error writing file: {e}"
+            return f"Error writing file: {e}"
 
     # ── List Directory ──
 
@@ -356,14 +355,14 @@ def register_system_tools(
     async def list_directory(path: str) -> str:
         path = Path(path).expanduser().resolve()
         if not path.exists():
-            return f"❌ Directory not found: {path}"
+            return f"Directory not found: {path}"
         if not path.is_dir():
-            return f"❌ Not a directory: {path}"
+            return f"Not a directory: {path}"
         try:
             entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
             lines = []
             for entry in entries[:200]:
-                prefix = "📁" if entry.is_dir() else "📄"
+                prefix = "[dir] " if entry.is_dir() else "[file]"
                 size = ""
                 if entry.is_file():
                     try:
@@ -377,7 +376,7 @@ def register_system_tools(
                 result += f"\n... and {len(entries) - 200} more items"
             return result
         except Exception as e:
-            return f"❌ Error listing directory: {e}"
+            return f"Error listing directory: {e}"
 
     # ── System Info ──
 
@@ -410,7 +409,7 @@ def register_system_tools(
             )
             return info
         except Exception as e:
-            return f"❌ Error getting system info: {e}"
+            return f"Error getting system info: {e}"
 
     # ── Open URL ──
 
@@ -432,9 +431,9 @@ def register_system_tools(
         import webbrowser
         try:
             webbrowser.open(url)
-            return f"✅ Opened {url} in browser"
+            return f"Opened {url} in browser"
         except Exception as e:
-            return f"❌ Error opening URL: {e}"
+            return f"Error opening URL: {e}"
 
     # ── Search Files ──
 
@@ -464,7 +463,7 @@ def register_system_tools(
         import fnmatch
         root = Path(directory).expanduser().resolve()
         if not root.exists():
-            return f"❌ Directory not found: {root}"
+            return f"Directory not found: {root}"
         matches = []
         try:
             for path in root.rglob("*"):
@@ -514,9 +513,9 @@ def register_system_tools(
             else:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(src), str(dst))
-            return f"✅ Copied {src} → {dst}"
+            return f"Copied {src} -> {dst}"
         except Exception as e:
-            return f"❌ Copy failed: {e}"
+            return f"Copy failed: {e}"
 
     @registry.tool(
         name="move_file",
@@ -536,9 +535,9 @@ def register_system_tools(
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
-            return f"✅ Moved {src} → {dst}"
+            return f"Moved {src} -> {dst}"
         except Exception as e:
-            return f"❌ Move failed: {e}"
+            return f"Move failed: {e}"
 
     @registry.tool(
         name="delete_file",
@@ -557,14 +556,14 @@ def register_system_tools(
         try:
             if p.is_dir():
                 shutil.rmtree(str(p))
-                return f"✅ Deleted directory: {p}"
+                return f"Deleted directory: {p}"
             elif p.is_file():
                 p.unlink()
-                return f"✅ Deleted file: {p}"
+                return f"Deleted file: {p}"
             else:
-                return f"❌ Path not found: {p}"
+                return f"Path not found: {p}"
         except Exception as e:
-            return f"❌ Delete failed: {e}"
+            return f"Delete failed: {e}"
 
     @registry.tool(
         name="create_directory",
@@ -581,9 +580,9 @@ def register_system_tools(
         p = Path(path).expanduser().resolve()
         try:
             p.mkdir(parents=True, exist_ok=True)
-            return f"✅ Created directory: {p}"
+            return f"Created directory: {p}"
         except Exception as e:
-            return f"❌ Failed to create directory: {e}"
+            return f"Failed to create directory: {e}"
 
     # ── Process Management ──
 
@@ -620,7 +619,7 @@ def register_system_tools(
                 lines.append(f"... and {len(procs) - 50} more")
             return "\n".join(lines)
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     @registry.tool(
         name="kill_process",
@@ -644,7 +643,7 @@ def register_system_tools(
                 pid = int(target)
                 proc = psutil.Process(pid)
                 proc.terminate()
-                return f"✅ Terminated process {proc.name()} (PID {pid})"
+                return f"Terminated process {proc.name()} (PID {pid})"
             except ValueError:
                 pass
 
@@ -658,10 +657,10 @@ def register_system_tools(
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
             if killed:
-                return f"✅ Terminated: {', '.join(killed)}"
-            return f"❌ No process found matching '{target}'"
+                return f"Terminated: {', '.join(killed)}"
+            return f"No process found matching '{target}'"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     # ── Volume Control (Windows) ──
 
@@ -681,7 +680,7 @@ def register_system_tools(
     )
     async def set_volume(level: int) -> str:
         if platform.system() != "Windows":
-            return "❌ Volume control only supported on Windows"
+            return "Volume control only supported on Windows"
         try:
             if level == -1:
                 # Toggle mute via nircmd or PowerShell
@@ -691,7 +690,7 @@ def register_system_tools(
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await result.communicate()
-                return "✅ Toggled mute"
+                return "Toggled mute"
             else:
                 level = max(0, min(100, level))
                 # Use PowerShell to set volume
@@ -709,9 +708,9 @@ def register_system_tools(
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(result.communicate(), timeout=10)
-                return f"✅ Volume set to ~{level}%"
+                return f"Volume set to ~{level}%"
         except Exception as e:
-            return f"❌ Error setting volume: {e}"
+            return f"Error setting volume: {e}"
 
     # ── Screenshot ──
 
@@ -737,11 +736,11 @@ def register_system_tools(
                 save_path = str(save_dir / "screenshot.png")
             img = pyautogui.screenshot()
             img.save(save_path)
-            return f"✅ Screenshot saved to {save_path}"
+            return f"Screenshot saved to {save_path}"
         except ImportError:
-            return "❌ pyautogui not installed. Run: pip install pyautogui"
+            return "pyautogui not installed. Run: pip install pyautogui"
         except Exception as e:
-            return f"❌ Screenshot failed: {e}"
+            return f"Screenshot failed: {e}"
 
     # ── Clipboard ──
 
@@ -756,9 +755,9 @@ def register_system_tools(
             content = pyperclip.paste()
             return content if content else "(clipboard is empty)"
         except ImportError:
-            return "❌ pyperclip not installed. Run: pip install pyperclip"
+            return "pyperclip not installed. Run: pip install pyperclip"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     @registry.tool(
         name="clipboard_write",
@@ -775,11 +774,11 @@ def register_system_tools(
         try:
             import pyperclip
             pyperclip.copy(text)
-            return f"✅ Copied {len(text)} chars to clipboard"
+            return f"Copied {len(text)} chars to clipboard"
         except ImportError:
-            return "❌ pyperclip not installed. Run: pip install pyperclip"
+            return "pyperclip not installed. Run: pip install pyperclip"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     # ── Keyboard / Window Control ──
 
@@ -842,10 +841,10 @@ def register_system_tools(
                     try:
                         windows[0].activate()
                         time.sleep(0.5)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("window activation failed app=%s error=%s", app, e)
                 else:
-                    return f"❌ Could not open or find {app} window"
+                    return f"Could not open or find {app} window"
 
             # Type each character via press() — works with UWP apps like Calculator
             for ch in text:
@@ -853,11 +852,11 @@ def register_system_tools(
                 time.sleep(0.05)
 
             target = f" in {app}" if app else ""
-            return f"✅ Typed '{text}'{target}"
+            return f"Typed '{text}'{target}"
         except ImportError:
-            return "❌ pyautogui not installed. Run: pip install pyautogui"
+            return "pyautogui not installed. Run: pip install pyautogui"
         except Exception as e:
-            return f"❌ Error typing text: {e}"
+            return f"Error typing text: {e}"
 
     @registry.tool(
         name="focus_window",
@@ -875,22 +874,22 @@ def register_system_tools(
     )
     async def focus_window(title: str) -> str:
         if platform.system() != "Windows":
-            return "❌ Only supported on Windows"
+            return "Only supported on Windows"
         try:
             import time
 
             import pyautogui
             windows = pyautogui.getWindowsWithTitle(title)
             if not windows:
-                return f"❌ No window found with title containing '{title}'"
+                return f"No window found with title containing '{title}'"
             win = windows[0]
             win.activate()
             time.sleep(0.3)
-            return f"✅ Focused window: {win.title}"
+            return f"Focused window: {win.title}"
         except ImportError:
-            return "❌ pyautogui not installed"
+            return "pyautogui not installed"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     @registry.tool(
         name="send_keystrokes",
@@ -916,11 +915,11 @@ def register_system_tools(
                 pyautogui.hotkey(*keys.split("+"))
             else:
                 pyautogui.press(keys)
-            return f"✅ Sent keystrokes: {keys}"
+            return f"Sent keystrokes: {keys}"
         except ImportError:
-            return "❌ pyautogui not installed. Run: pip install pyautogui"
+            return "pyautogui not installed. Run: pip install pyautogui"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     @registry.tool(
         name="window_management",
@@ -942,12 +941,12 @@ def register_system_tools(
     )
     async def window_management(action: str, title: str) -> str:
         if platform.system() != "Windows":
-            return "❌ Window management only supported on Windows"
+            return "Window management only supported on Windows"
         try:
             import pyautogui
             windows = pyautogui.getWindowsWithTitle(title)
             if not windows:
-                return f"❌ No window found with title containing '{title}'"
+                return f"No window found with title containing '{title}'"
             win = windows[0]
             if action == "focus":
                 win.activate()
@@ -958,12 +957,12 @@ def register_system_tools(
             elif action == "close":
                 win.close()
             else:
-                return f"❌ Unknown action: {action}. Use focus/minimize/maximize/close."
-            return f"✅ {action.title()}ed window: {win.title}"
+                return f"Unknown action: {action}. Use focus/minimize/maximize/close."
+            return f"{action.title()}ed window: {win.title}"
         except ImportError:
-            return "❌ pyautogui not installed. Run: pip install pyautogui"
+            return "pyautogui not installed. Run: pip install pyautogui"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     # ── Get Current Time/Date ──
 
@@ -1020,7 +1019,7 @@ def register_system_tools(
                     f"Body: {resp.text[:2000]}"
                 )
         except Exception as e:
-            return f"❌ HTTP error: {e}"
+            return f"HTTP error: {e}"
 
     # ── Scheduling (NullClaw-inspired) ──
 
@@ -1054,10 +1053,10 @@ def register_system_tools(
                 shell=False, capture_output=True, text=True,
             )
             if result.returncode == 0:
-                return f"✅ Scheduled '{task_name}' to run at {start_time} on {start_date}"
-            return f"❌ Failed: {result.stderr.strip() or result.stdout.strip()}"
+                return f"Scheduled '{task_name}' to run at {start_time} on {start_date}"
+            return f"Failed: {result.stderr.strip() or result.stdout.strip()}"
         except Exception as e:
-            return f"❌ Scheduler error: {e}"
+            return f"Scheduler error: {e}"
 
     @registry.tool(
         name="scheduler_list",
@@ -1073,7 +1072,7 @@ def register_system_tools(
             )
             return result.stdout or "No Jarvis tasks scheduled."
         except Exception as e:
-            return f"❌ List error: {e}"
+            return f"List error: {e}"
 
     @registry.tool(
         name="scheduler_delete",
@@ -1094,10 +1093,10 @@ def register_system_tools(
                 shell=False, capture_output=True, text=True,
             )
             if result.returncode == 0:
-                return f"✅ Deleted task: {task_name}"
-            return f"❌ Failed: {result.stderr}"
+                return f"Deleted task: {task_name}"
+            return f"Failed: {result.stderr}"
         except Exception as e:
-            return f"❌ Delete error: {e}"
+            return f"Delete error: {e}"
 
     # ── Web Search (NullClaw-inspired) ──
 
@@ -1193,11 +1192,11 @@ def register_system_tools(
                 import uptime
                 return f"Uptime: {uptime.format_timespan(uptime.uptime())}"
         except Exception as e:
-            return f"❌ Error: {e}"
+            return f"Error: {e}"
 
     # Register vision tools if LLM client is available
     if llm_client is not None:
         from jarvis.tools.vision_tools import register_vision_tools
         register_vision_tools(registry, llm_client)
 
-    logger.info("✅ Registered %d system tools", len(registry))
+    logger.debug("system tools registered count=%d", len(registry))

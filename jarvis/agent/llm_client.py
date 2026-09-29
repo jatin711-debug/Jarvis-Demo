@@ -77,7 +77,7 @@ class LLMClient:
                 f"Available models: {', '.join(models) or '(none)'}"
             )
 
-        logger.info("✅ Ollama connected at %s (model=%s)", self.base_url, self.config.model)
+        logger.info("ollama connected url=%s model=%s", self.base_url, self.config.model)
 
     def _model_name_matches(self, tag: str) -> bool:
         """Match 'qwen3:4b' against tags like 'qwen3:4b' or 'name:latest'."""
@@ -92,12 +92,12 @@ class LLMClient:
             resp.raise_for_status()
             return [m.get("name", "") for m in resp.json().get("models", [])]
         except Exception as e:
-            logger.warning("Ollama model list failed: %s", e)
+            logger.warning("ollama model list failed error=%s", e)
             return None
 
     async def _startup_huggingface(self) -> None:
         """Initialize HuggingFace Transformers model."""
-        logger.info("🔄 Loading HuggingFace model: %s", self.config.model)
+        logger.info("loading huggingface model=%s (first run downloads weights)", self.config.model)
 
         loop = asyncio.get_event_loop()
 
@@ -121,7 +121,7 @@ class LLMClient:
         self._hf_model, self._hf_tokenizer = await loop.run_in_executor(
             None, _load_model
         )
-        logger.info("✅ HuggingFace model loaded: %s", self.config.model)
+        logger.info("huggingface model loaded model=%s", self.config.model)
 
     async def shutdown(self) -> None:
         """Close the LLM client."""
@@ -138,7 +138,7 @@ class LLMClient:
         models = await self.list_models()
         if models is None:
             return False
-        logger.debug("Available models: %s", models)
+        logger.debug("ollama models available=%s", models)
         return True
 
     def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
@@ -228,14 +228,13 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
 
-        logger.debug("LLM request: %d messages, %d images", len(msgs), len(images or []))
+        logger.debug("llm request messages=%d images=%d", len(msgs), len(images or []))
 
         resp = await self._client.post(_API_CHAT, json=payload)
         resp.raise_for_status()
         result = resp.json()
 
-        logger.debug("LLM response: %d chars",
-                      len(result.get("message", {}).get("content", "")))
+        logger.debug("llm response chars=%d", len(result.get("message", {}).get("content", "")))
         return result
 
     async def _chat_huggingface(
@@ -248,7 +247,7 @@ class LLMClient:
         content = "".join([chunk async for chunk in
                            self._chat_stream_huggingface(messages, temperature, max_tokens)])
 
-        logger.debug("HF response: %d chars", len(content))
+        logger.debug("huggingface response chars=%d", len(content))
         return {"message": {"role": "assistant", "content": content}}
 
     async def chat_stream(

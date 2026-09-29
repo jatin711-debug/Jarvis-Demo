@@ -90,7 +90,7 @@ class DummySTT(STTEngine):
     """Placeholder STT — just returns keyboard input."""
 
     async def startup(self) -> None:
-        logger.info("📝 DummySTT ready (keyboard input mode)")
+        logger.info("stt ready engine=dummy")
 
     async def shutdown(self) -> None:
         pass
@@ -108,24 +108,24 @@ class DummyTTS(TTSEngine):
     """Placeholder TTS — just prints to console."""
 
     async def startup(self) -> None:
-        logger.info("🔊 DummyTTS ready (console output mode)")
+        logger.info("tts ready engine=dummy")
 
     async def shutdown(self) -> None:
         pass
 
     async def synthesize(self, text: str) -> bytes:
-        logger.info("🔊 [TTS] %s", text)
+        logger.info("tts say text=%r", text)
         return b""
 
     async def speak(self, text: str) -> None:
-        logger.info("🔊 [TTS] %s", text)
+        logger.info("tts say text=%r", text)
 
 
 class DummyWakeWord(WakeWordEngine):
     """Placeholder wake word — always active."""
 
     async def startup(self) -> None:
-        logger.info("👂 DummyWakeWord ready (always active)")
+        logger.info("wake word ready engine=dummy")
 
     async def shutdown(self) -> None:
         pass

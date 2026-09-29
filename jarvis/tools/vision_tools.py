@@ -10,8 +10,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 from jarvis.agent.llm_client import LLMClient
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.logger import get_logger
@@ -71,7 +69,7 @@ class VisionClient:
         )
 
         content = await self._ask_vision(prompt, system_hint=system_hint)
-        logger.debug("Grounding response for '%s': %s", name, content)
+        logger.debug("grounding response element=%r content=%s", name, content)
 
         match = re.search(r"x[=:]\s*([0-9.]+)[,;\s]+y[=:]\s*([0-9.]+)", content, re.IGNORECASE)
         if not match:
@@ -82,7 +80,7 @@ class VisionClient:
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
         px, py = int(nx * screen_w), int(ny * screen_h)
-        logger.info("Grounded '%s' at screen coords (%d, %d)", name, px, py)
+        logger.info("grounded element=%r x=%d y=%d", name, px, py)
         return (px, py)
 
     async def find_elements(self, query: str) -> list[dict[str, Any]]:
@@ -104,7 +102,7 @@ class VisionClient:
         )
 
         content = await self._ask_vision(prompt, system_hint=system_hint)
-        logger.debug("Find elements response: %s", content)
+        logger.debug("find elements response=%s", content)
 
         results = []
         for line in content.splitlines():
@@ -122,7 +120,7 @@ class VisionClient:
                     "y": int(ny * screen_h),
                 })
 
-        logger.info("Found %d elements for query '%s'", len(results), query)
+        logger.info("found elements count=%d query=%r", len(results), query)
         return results
 
     async def analyze_image(self, image_path: str, question: str = "") -> str:
@@ -156,7 +154,7 @@ class VisionClient:
                 full_text = full_text[:8000] + "\n\n[...truncated...]"
             return full_text if full_text else "No text found in PDF."
         except Exception as e:
-            logger.error("PDF read failed: %s", e)
+            logger.error("pdf read failed error=%s", e)
             return f"Error reading PDF: {e}"
 
     async def read_spreadsheet(self, file_path: str) -> str:
@@ -166,6 +164,8 @@ class VisionClient:
             return f"File not found: {path}"
 
         try:
+            import pandas as pd  # heavy; loaded only when a spreadsheet is read
+
             suffix = path.suffix.lower()
 
             if suffix == ".csv":
@@ -182,7 +182,7 @@ class VisionClient:
             summary += df.head(10).to_string(index=False)
             return summary
         except Exception as e:
-            logger.error("Spreadsheet read failed: %s", e)
+            logger.error("spreadsheet read failed error=%s", e)
             return f"Error reading spreadsheet: {e}"
 
 

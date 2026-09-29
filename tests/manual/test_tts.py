@@ -19,16 +19,16 @@ async def test_tts():
         import soundfile as sf
         from kokoro import KPipeline
     except ImportError:
-        print("❌ Kokoro or soundfile not installed.")
+        print("Kokoro or soundfile not installed.")
         return
 
     # Kokoro uses early-binding Pipelines.
     # English language code is 'a' (American) or 'b' (British).
     try:
         pipeline = KPipeline(lang_code='a')
-        print("✅ Pipeline initialized.")
+        print("Pipeline initialized.")
     except Exception as e:
-        print(f"❌ Failed to initialize pipeline: {e}")
+        print(f"Failed to initialize pipeline: {e}")
         return
 
     text = "Hello there! I am Jarvis. My voice generation system is now fully operational."
@@ -53,13 +53,13 @@ async def test_tts():
             os.makedirs(".jarvis_test", exist_ok=True)
             out_file = f".jarvis_test/tts_test_{i}.wav"
             sf.write(out_file, audio, samplerate)
-            print(f"  ✅ Saved to {out_file}")
+            print(f"  Saved to {out_file}")
 
     except Exception as e:
-        print(f"❌ Synthesis failed: {e}")
+        print(f"Synthesis failed: {e}")
         return
 
-    print("\n✅ TTS test complete!")
+    print("\nTTS test complete!")
 
 if __name__ == "__main__":
     asyncio.run(test_tts())

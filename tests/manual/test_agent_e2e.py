@@ -50,7 +50,7 @@ async def test():
     print(f"Response: {response}")
 
     await llm.shutdown()
-    print("\n✅ All tests passed!")
+    print("\nAll tests passed!")
 
 
 if __name__ == "__main__":

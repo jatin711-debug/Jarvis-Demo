@@ -39,7 +39,7 @@ class MemoryManager:
     async def startup(self) -> None:
         """Initialize Mem0 with local Ollama configuration."""
         if not self._config.enabled:
-            logger.info("Memory disabled in config")
+            logger.info("memory disabled by config")
             return
 
         try:
@@ -80,19 +80,19 @@ class MemoryManager:
 
             self._memory = await asyncio.to_thread(Memory.from_config, config)
             self._session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-            logger.info("✅ Mem0 initialized (vectors: %s)", vector_path)
+            logger.info("ready backend=mem0 vectors=%s", vector_path)
 
         except ImportError:
-            logger.warning("mem0ai not installed — memory disabled")
+            logger.warning("memory disabled reason=mem0ai_not_installed")
             self._config.enabled = False
         except Exception as e:
-            logger.error("Failed to initialize Mem0: %s", e)
+            logger.error("memory init failed error=%s", e)
             self._config.enabled = False
 
     async def shutdown(self) -> None:
         """Clean up memory resources."""
         self._memory = None
-        logger.info("Memory manager shut down")
+        logger.debug("memory stopped")
 
     async def add_conversation(
         self,
@@ -128,9 +128,9 @@ class MemoryManager:
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, _add)
-            logger.debug("Memory stored for conversation with user '%s'", uid)
+            logger.debug("memory stored user=%s", uid)
         except Exception as e:
-            logger.warning("Failed to store memory: %s", e)
+            logger.warning("memory write failed error=%s", e)
 
     async def get_context(
         self,
@@ -162,10 +162,10 @@ class MemoryManager:
         try:
             results = await loop.run_in_executor(None, _search)
             memories = [entry["memory"] for entry in results.get("results", [])]
-            logger.debug("Retrieved %d memories for query", len(memories))
+            logger.debug("memory search hits=%d", len(memories))
             return memories
         except Exception as e:
-            logger.warning("Memory search failed: %s", e)
+            logger.warning("memory search failed error=%s", e)
             return []
 
     async def get_all_memories(
@@ -186,5 +186,5 @@ class MemoryManager:
         try:
             return await loop.run_in_executor(None, _get_all)
         except Exception as e:
-            logger.warning("Failed to get all memories: %s", e)
+            logger.warning("memory list failed error=%s", e)
             return []

@@ -60,7 +60,7 @@ class TestRunCommandGate:
     async def test_catastrophic_command_blocked(self):
         registry = _registry_with(SecurityConfig())
         result = await registry.execute("run_command", command="format c:")
-        assert result.startswith("❌ Blocked")
+        assert result.startswith("Blocked")
         assert "formats a disk" in result
 
     async def test_config_blocklist_enforced(self):
