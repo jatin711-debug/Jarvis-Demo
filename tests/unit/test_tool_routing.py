@@ -70,7 +70,6 @@ async def test_explanation_has_no_tool_menu():
 
 def test_file_search_does_not_route_to_browser():
     agent = ReActAgent(Model([]), registry([]), "sys", browser_tools=ToolRegistry())
-    assert not agent._needs_browser_tools("search the files in this project")
-    chosen = select_system_tools("search the files in this project",
-                                 set(agent.tools.list_tools()))
+    chosen, _ = select_system_tools("search the files in this project",
+                                    set(agent.tools.list_tools()))
     assert chosen == {"read_file"}

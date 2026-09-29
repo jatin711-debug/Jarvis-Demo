@@ -16,6 +16,10 @@ from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Results the agent recognizes as "stop this turn" signals.
+CANCELLED_MESSAGE = "Action cancelled by the user."
+PERMISSION_DENIED_PREFIX = "Permission denied:"
+
 # Callback: (tool_name, args) -> True to proceed, False to cancel
 ConfirmCallback = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
@@ -162,14 +166,14 @@ class ToolRegistry:
                 repeatable=repeatable,
             )
             self._tools[name] = tool_def
-            logger.debug("Registered tool: %s", name)
+            logger.debug("tool registered name=%s", name)
             return func
         return decorator
 
     def register(self, tool_def: ToolDefinition) -> None:
         """Register a tool directly (non-decorator style)."""
         self._tools[tool_def.name] = tool_def
-        logger.debug("Registered tool: %s", tool_def.name)
+        logger.debug("tool registered name=%s", tool_def.name)
 
     def get(self, name: str) -> ToolDefinition | None:
         """Get a tool by name."""
@@ -186,9 +190,9 @@ class ToolRegistry:
         if error:
             allowed = list(tool.parameters.get("properties", {}))
             required = tool.parameters.get("required", [])
-            logger.warning("Rejected tool %s: %s; allowed=%s required=%s",
+            logger.warning("tool rejected name=%s error=%s allowed=%s required=%s",
                            tool_name, error, allowed, required)
-            return (f"❌ Invalid arguments for {tool_name}: {error}. "
+            return (f"Invalid arguments for {tool_name}: {error}. "
                     f"Allowed parameter names: {allowed}. Required parameter names: {required}. "
                     "Unknown parameters must be removed, not supplied. No action was executed.")
 
@@ -196,37 +200,36 @@ class ToolRegistry:
             decision = self._permission_gateway.inspect(
                 tool_name, kwargs, tool_requires_confirmation=tool.requires_confirmation)
             if not decision.allowed:
-                logger.warning("Permission denied for %s: %s", tool_name, decision.reason)
-                return f"Permission denied: {decision.reason}. No action was executed."
+                logger.warning("tool denied name=%s reason=%s", tool_name, decision.reason)
+                return f"{PERMISSION_DENIED_PREFIX} {decision.reason}. No action was executed."
             if decision.requires_confirmation:
                 if self._confirm_callback is None:
-                    return "Permission denied: confirmation is unavailable. No action was executed."
+                    return f"{PERMISSION_DENIED_PREFIX} confirmation is unavailable. No action was executed."
                 summary = {"effect": decision.effect, "target": decision.target,
                            "action_id": decision.action_id}
                 approved = await self._confirm_callback(tool_name, summary)
                 if not approved:
-                    logger.info("Tool '%s' cancelled by user", tool_name)
-                    return "Action cancelled by the user."
+                    logger.info("tool cancelled by user name=%s", tool_name)
+                    return CANCELLED_MESSAGE
                 # Recheck after a slow voice/text approval. A changed scope
                 # or symlink target cannot inherit the earlier approval.
                 current = self._permission_gateway.inspect(
                     tool_name, kwargs, tool_requires_confirmation=tool.requires_confirmation)
                 if (not current.allowed or current.action_id != decision.action_id
                         or current.target != decision.target):
-                    return "Permission denied: target changed during confirmation. No action was executed."
+                    return f"{PERMISSION_DENIED_PREFIX} target changed during confirmation. No action was executed."
         elif tool.requires_confirmation and self._confirm_callback is not None:
             approved = await self._confirm_callback(tool_name, kwargs)
             if not approved:
-                logger.info("Tool '%s' cancelled by user", tool_name)
-                return "Action cancelled by the user."
+                logger.info("tool cancelled by user name=%s", tool_name)
+                return CANCELLED_MESSAGE
 
-        logger.info("Executing tool: %s", tool_name)
+        # The agent logs the call and its outcome at INFO; this is registry-level detail.
+        logger.debug("tool dispatch name=%s", tool_name)
         try:
-            result = await tool.handler(**kwargs)
-            logger.info("Tool '%s' completed", tool_name)
-            return result
+            return await tool.handler(**kwargs)
         except Exception as e:
-            logger.error("Tool '%s' failed: %s", tool_name, e)
+            logger.debug("tool handler raised name=%s error=%s", tool_name, e)
             raise
 
     def get_ollama_tools(self) -> list[dict[str, Any]]:

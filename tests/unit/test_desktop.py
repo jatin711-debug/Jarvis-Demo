@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from jarvis.agent.react_agent import ReActAgent
+from jarvis.agent.routing import Route, Surface
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.desktop.cua import CuaDesktop, register_desktop_tools
 from jarvis.utils.config import DesktopConfig
@@ -146,11 +147,8 @@ def test_six_tools_and_selective_routing(desktop):
     assert registry.get("desktop_click").requires_confirmation
     agent = ReActAgent(llm=SimpleNamespace(provider="ollama"), tools=ToolRegistry(),
                        system_prompt="test", desktop_tools=registry)
-    assert agent._needs_desktop_tools("open notepad")
-    assert not agent._needs_desktop_tools("search the web and click a link")
-    agent._desktop_active = True
-    assert agent._needs_desktop_tools("do that again")
-    assert not agent._needs_desktop_tools("what is the weather")
+    assert [t.name for t in agent._tools_for(Route(Surface.DESKTOP))] == registry.list_tools()
+    assert agent._tools_for(Route(Surface.CHAT)) == []
 
 
 async def test_agent_routes_native_calls_and_allows_repeated_observations(desktop):
