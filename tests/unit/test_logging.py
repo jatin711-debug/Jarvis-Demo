@@ -29,6 +29,19 @@ def no_active_turn():
     end_turn()
 
 
+@pytest.fixture(autouse=True)
+def restore_root_logger():
+    """setup_logging replaces the root handlers; put them back so later tests are unaffected."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    for handler in root.handlers:
+        if handler not in handlers:
+            handler.close()
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
+
 def test_console_line_has_level_component_and_message():
     line = ConsoleFormatter(color=False).format(make_record("route surface=chat"))
     assert "INFO " in line

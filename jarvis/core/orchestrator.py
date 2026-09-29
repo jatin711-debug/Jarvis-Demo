@@ -11,6 +11,7 @@ import asyncio
 import re
 import sys
 import time
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +53,9 @@ _DISMISS_PHRASES = frozenset({
 })
 
 _REPLY_LOG_CHARS = 300
+
+# Recorded after a reply the user talked over, so the next turn knows it was cut short.
+_INTERRUPTED_NOTE = " [interrupted by the user]"
 
 
 @dataclass
@@ -239,21 +243,26 @@ class Orchestrator:
 
         self.wake_word.suppress()
         try:
-            async for token in agent.run_stream(
+            # Closing the stream on barge-in stops the model and, because the agent
+            # only advances when asked for the next token, any further tool calls.
+            async with aclosing(agent.run_stream(
                 user_message=text,
                 conversation_history=self._conversation_history,
                 context=context,
-            ):
-                if first_token_s is None:
-                    first_token_s = time.monotonic() - t_agent
-                full_response += token
-                pending += token
+            )) as stream:
+                async for token in stream:
+                    if first_token_s is None:
+                        first_token_s = time.monotonic() - t_agent
+                    full_response += token
+                    pending += token
 
-                split = _split_sentence(pending)
-                if split is not None:
-                    sentence, pending = split
-                    if sentence and not interrupted:
-                        interrupted = await speak(sentence)
+                    split = _split_sentence(pending)
+                    if split is not None:
+                        sentence, pending = split
+                        if sentence:
+                            interrupted = await speak(sentence)
+                            if interrupted:
+                                break
 
             leftover = pending.strip()
             if leftover and not interrupted:
@@ -271,13 +280,17 @@ class Orchestrator:
                 " barge_in=yes" if interrupted else "",
             )
 
-        self._remember_exchange(text, full_response)
+        if interrupted:
+            logger.info("turn cut short by barge-in; agent stopped chars=%d", len(full_response))
+        self._remember_exchange(text, full_response, interrupted=interrupted)
         return full_response
 
-    def _remember_exchange(self, user_text: str, response: str) -> None:
+    def _remember_exchange(self, user_text: str, response: str, *, interrupted: bool = False) -> None:
         """Append to the rolling history and queue a background memory write."""
         self._conversation_history.append({"role": "user", "content": user_text})
-        self._conversation_history.append({"role": "assistant", "content": response})
+        self._conversation_history.append({
+            "role": "assistant",
+            "content": response.rstrip() + _INTERRUPTED_NOTE if interrupted else response})
         limit = self.config.memory.max_conversation_turns * 2
         if len(self._conversation_history) > limit:
             self._conversation_history = self._conversation_history[-limit:]

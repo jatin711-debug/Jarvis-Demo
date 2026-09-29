@@ -42,6 +42,7 @@ Select-String -Path ~\.jarvis\logs\jarvis.log -Pattern '\| t7 \|'
 | `tool denied ...` / `confirmation ... approved=...` | Permission gateway decisions and voice/text approvals |
 | `latency record stt memory first_token agent speak total` | Where the time went (`agent` excludes speech; `total` = memory + agent + speak) |
 | `barge-in playback interrupted` | The user talked over a reply |
+| `turn cut short by barge-in; agent stopped` | The model stream was closed, so no further tool calls run; the history records the reply as interrupted |
 | `transcript ignored reason=noise` | A Whisper hallucination or stutter was dropped |
 
 Anything at WARN or ERROR is worth reading: a deadline was hit, a service failed to

@@ -383,13 +383,15 @@ class ReActAgent:
         logger.info("route %s", route.describe())
 
         if route.surface is Surface.SMALL_TALK:
-            async for token in self._small_talk(user_message, stream):
-                yield token
+            async with aclosing(self._small_talk(user_message, stream)) as tokens:
+                async for token in tokens:
+                    yield token
             return
 
         turn = await self._prepare_turn(user_message, conversation_history, context, route)
-        async for token in self._react_loop(turn, stream):
-            yield token
+        async with aclosing(self._react_loop(turn, stream)) as tokens:
+            async for token in tokens:
+                yield token
 
     async def _small_talk(self, user_message: str, stream: bool) -> AsyncIterator[str]:
         """Greetings: no tools, screenshots, memory, or history."""
@@ -458,9 +460,10 @@ class ReActAgent:
                          len(turn.native_tools or turn.tools))
             reply = _ModelReply()
             try:
-                async for token in self._call_model(turn, reply, first_iteration=iteration == 0,
-                                                    stream=stream):
-                    yield token
+                async with aclosing(self._call_model(turn, reply, first_iteration=iteration == 0,
+                                                     stream=stream)) as tokens:
+                    async for token in tokens:
+                        yield token
             except (TimeoutError, httpx.TimeoutException):
                 logger.warning("model deadline reached; ending turn without retry")
                 yield "The local model is taking too long to respond. Please try again."
@@ -632,8 +635,10 @@ class ReActAgent:
     ) -> str:
         """Process a user message through the ReAct loop. Returns the response."""
         parts: list[str] = []
-        async for token in self._run_impl(user_message, conversation_history, context, stream=False):
-            parts.append(token)
+        async with aclosing(self._run_impl(user_message, conversation_history, context,
+                                           stream=False)) as tokens:
+            async for token in tokens:
+                parts.append(token)
         return "".join(parts)
 
     async def run_stream(
@@ -646,8 +651,10 @@ class ReActAgent:
         Same as run(), but streams the answer token-by-token as it is
         generated, including the final answer after any tool calls.
         """
-        async for token in self._run_impl(user_message, conversation_history, context, stream=True):
-            yield token
+        async with aclosing(self._run_impl(user_message, conversation_history, context,
+                                           stream=True)) as tokens:
+            async for token in tokens:
+                yield token
 
     async def research(self, query: str, max_sources: int = 5) -> str:
         """Experimental autonomous web research; not wired into the voice loop."""

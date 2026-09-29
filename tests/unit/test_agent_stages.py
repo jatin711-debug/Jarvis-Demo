@@ -192,3 +192,43 @@ class TestToolSurfaces:
         assert await agent._execute_tool("browser_read_page") == "page"
         with pytest.raises(ValueError, match="Unknown tool"):
             await agent._execute_tool("missing")
+
+
+class StreamingLLM:
+    """Stream fake: yields a spoken prefix, then a tool call, like a real Ollama reply."""
+
+    provider = "ollama"
+
+    def __init__(self):
+        self.events_sent = 0
+        self.stream_closed = False
+
+    async def chat_stream_events(self, **kwargs):
+        try:
+            self.events_sent += 1
+            yield {"type": "content", "text": "Sure. "}
+            self.events_sent += 1
+            yield {"type": "done", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"file_path": "secret.txt"}}}]}
+        finally:
+            self.stream_closed = True
+
+
+class TestStreamInterruption:
+    async def test_closing_the_stream_before_the_tool_call_runs_no_tool(self):
+        from contextlib import aclosing
+
+        record = []
+        llm = StreamingLLM()
+        agent = ReActAgent(llm, make_tools(record), "sys")
+        async with aclosing(agent.run_stream("read the file list")) as stream:
+            first = await anext(stream)
+        assert first == "Sure. "
+        assert record == []  # the requested read never happened
+        assert llm.stream_closed  # the model connection was released
+
+    async def test_letting_the_stream_finish_does_run_the_tool(self):
+        record = []
+        agent = ReActAgent(StreamingLLM(), make_tools(record), "sys")
+        [_ async for _ in agent.run_stream("read the file list")]
+        assert record == ["secret.txt"]  # identical repeat calls are suppressed

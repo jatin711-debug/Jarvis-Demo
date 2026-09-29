@@ -17,6 +17,8 @@ class FakeAgent:
         self.reply = reply
         self.error = error
         self.calls = []
+        self.produced = 0  # tokens the consumer actually pulled
+        self.closed = False
 
     async def run(self, **kwargs):
         self.calls.append(kwargs)
@@ -28,8 +30,12 @@ class FakeAgent:
         self.calls.append(kwargs)
         if self.error:
             raise self.error
-        for token in self.tokens:
-            yield token
+        try:
+            for token in self.tokens:
+                self.produced += 1
+                yield token
+        finally:
+            self.closed = True
 
 
 def make_app(agent=None, *, barge_in=False, latency_report=True):
@@ -127,14 +133,30 @@ class TestStreamingTurn:
             await app._respond_streaming(_Heard("do something", 0, 0))
         assert not any(r.getMessage().startswith("latency") for r in caplog.records)
 
-    async def test_barge_in_stops_further_speech_but_keeps_the_full_reply(self, caplog):
-        app = make_app(FakeAgent(tokens=["One. ", "Two. ", "Three."]))
+    async def test_barge_in_stops_the_agent_and_marks_the_history(self, caplog):
+        agent = FakeAgent(tokens=["One. ", "Two. ", "Three."])
+        app = make_app(agent)
         app._speak_interruptible = AsyncMock(side_effect=[True])
         with caplog.at_level(logging.INFO, logger="jarvis.core.orchestrator"):
             result = await app._respond_streaming(_Heard("count", 0, 0))
-        assert result == "One. Two. Three."
+        assert result == "One. "
         assert app._speak_interruptible.await_count == 1
+        assert agent.produced == 1 and agent.closed  # nothing was generated after the interruption
         assert any("barge_in=yes" in r.getMessage() for r in caplog.records)
+        assert app._conversation_history[-1]["content"] == "One. [interrupted by the user]"
+
+    async def test_interrupted_reply_is_stored_in_memory_without_the_marker(self):
+        app = make_app(FakeAgent(tokens=["Sure thing. ", "More."]))
+        app._speak_interruptible = AsyncMock(side_effect=[True])
+        await app._respond_streaming(_Heard("remember my dentist is on friday", 0, 0))
+        await next(iter(app._memory_tasks))
+        app.memory.add_conversation.assert_awaited_once_with(
+            "remember my dentist is on friday", "Sure thing. ")
+
+    async def test_uninterrupted_reply_is_stored_verbatim(self):
+        app = make_app(FakeAgent(tokens=["All done."]))
+        await app._respond_streaming(_Heard("do the thing", 0, 0))
+        assert app._conversation_history[-1]["content"] == "All done."
 
     async def test_wake_word_is_resumed_even_if_the_agent_fails(self):
         app = make_app(FakeAgent(error=RuntimeError("model crashed")))
