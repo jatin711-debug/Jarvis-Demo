@@ -51,38 +51,6 @@ class VisionClient:
         resp = await self.llm.chat(messages=messages, images=[image_b64])
         return resp.get("message", {}).get("content", "")
 
-    async def ground_element(self, name: str) -> tuple[int, int] | None:
-        """
-        Find a UI element by name and return its screen coordinates.
-        Returns (x, y) in pixels or None if not found.
-        """
-        import pyautogui
-        screen_w, screen_h = pyautogui.size()
-
-        prompt = (
-            f'Find the "{name}" in the screenshot. '
-            "Reply with ONLY the normalized center coordinates as: x=0.XX y=0.YY"
-        )
-        system_hint = (
-            "You are a precise UI automation assistant. "
-            "Only output coordinates. Do not explain."
-        )
-
-        content = await self._ask_vision(prompt, system_hint=system_hint)
-        logger.debug("grounding response element=%r content=%s", name, content)
-
-        match = re.search(r"x[=:]\s*([0-9.]+)[,;\s]+y[=:]\s*([0-9.]+)", content, re.IGNORECASE)
-        if not match:
-            return None
-
-        nx, ny = float(match.group(1)), float(match.group(2))
-        # Clamp to valid range
-        nx = max(0.0, min(1.0, nx))
-        ny = max(0.0, min(1.0, ny))
-        px, py = int(nx * screen_w), int(ny * screen_h)
-        logger.info("grounded element=%r x=%d y=%d", name, px, py)
-        return (px, py)
-
     async def find_elements(self, query: str) -> list[dict[str, Any]]:
         """
         Find multiple UI elements matching a query.
@@ -189,29 +157,6 @@ class VisionClient:
 def register_vision_tools(registry: ToolRegistry, llm: LLMClient) -> None:
     """Register vision-based tools that require the LLM client."""
     vision = VisionClient(llm)
-
-    @registry.tool(
-        name="click_ui_element",
-        description="Click a UI element on the screen by its visible name (button, icon, menu item, etc.).",
-        parameters={
-            "type": "object",
-            "properties": {
-                "element_name": {
-                    "type": "string",
-                    "description": "Visible text or label of the UI element to click.",
-                },
-            },
-            "required": ["element_name"],
-        },
-    )
-    async def click_ui_element(element_name: str) -> str:
-        coords = await vision.ground_element(element_name)
-        if coords is None:
-            return f'Could not find "{element_name}" on screen.'
-        x, y = coords
-        import pyautogui
-        pyautogui.click(x, y)
-        return f'Clicked "{element_name}" at ({x}, {y}).'
 
     @registry.tool(
         name="find_ui_elements",

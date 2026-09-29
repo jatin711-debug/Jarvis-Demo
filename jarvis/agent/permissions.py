@@ -49,10 +49,9 @@ READ_TOOLS = frozenset({
 })
 LOCAL_TOOLS = frozenset({
     "write_file", "copy_file", "move_file", "delete_file", "create_directory", "set_volume",
-    "take_screenshot", "clipboard_write", "type_text", "focus_window", "send_keystrokes",
-    "window_management", "click_ui_element", "browser_type", "browser_scroll", "browser_screenshot", "browser_back",
-    "browser_forward", "browser_switch_tab", "browser_close", "desktop_click", "desktop_type",
-    "desktop_key",
+    "take_screenshot", "clipboard_write", "browser_type", "browser_scroll", "browser_screenshot",
+    "browser_back", "browser_forward", "browser_switch_tab", "browser_close", "desktop_click",
+    "desktop_type", "desktop_key",
 })
 CONTROL_TOOLS = frozenset({
     "run_command", "open_application", "kill_process", "scheduler_create", "scheduler_delete",
@@ -63,12 +62,6 @@ EXTERNAL_TOOLS = frozenset({
     "browser_new_tab", "browser_youtube_search",
 })
 KNOWN_TOOLS = READ_TOOLS | LOCAL_TOOLS | CONTROL_TOOLS | EXTERNAL_TOOLS
-
-# Registered but always refused: they act without an exact window/element target.
-# Cua's observed pid/window/snapshot controls replace them.
-REFUSED_TOOLS = frozenset({
-    "type_text", "send_keystrokes", "focus_window", "window_management", "click_ui_element",
-})
 
 PATH_FIELDS = {
     "read_file": ("file_path",), "write_file": ("file_path",),
@@ -82,10 +75,10 @@ DEFAULT_PATHS = {"take_screenshot": Path.home() / ".jarvis" / "screenshot.png",
                  "browser_screenshot": Path.home() / ".jarvis" / "browser_screenshot.png"}
 CONFIRM_TOOLS = frozenset({
     "write_file", "copy_file", "move_file", "delete_file", "create_directory",
-    "take_screenshot", "browser_screenshot", "clipboard_write", "type_text",
-    "send_keystrokes", "window_management", "run_command", "open_application",
-    "kill_process", "scheduler_create", "scheduler_delete", "desktop_launch",
-    "desktop_click", "desktop_type", "desktop_key", "browser_click", "browser_type",
+    "take_screenshot", "browser_screenshot", "clipboard_write", "run_command",
+    "open_application", "kill_process", "scheduler_create", "scheduler_delete",
+    "desktop_launch", "desktop_click", "desktop_type", "desktop_key", "browser_click",
+    "browser_type",
 })
 
 
@@ -230,12 +223,6 @@ class PermissionGateway:
                 target = str(args.get("target", ""))
                 if not target.isdecimal():
                     raise ValueError("Process termination requires an exact numeric PID")
-            elif name in {"type_text", "send_keystrokes"}:
-                raise ValueError("Global typing/keystrokes have no exact target; use Cua desktop controls")
-            elif name in {"focus_window", "window_management"}:
-                raise ValueError("Title-substring window actions have no exact target; use Cua")
-            elif name == "click_ui_element":
-                raise ValueError("Screen-coordinate clicks have no exact target; use Cua desktop controls")
             elif name.startswith("desktop_") and name not in {"desktop_windows", "desktop_launch"}:
                 target = f"pid={args.get('pid')}, window_id={args.get('window_id')}"
             elif name.startswith("browser_") and self.security.allowed_hosts is not None:

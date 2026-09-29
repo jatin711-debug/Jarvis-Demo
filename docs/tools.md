@@ -7,20 +7,18 @@ surface's tools (see `jarvis/agent/routing.py`). "Confirms" means the tool asks 
 an exact yes when `security.confirm_dangerous_ops` is on. Every call is also
 checked by the permission gateway ([security](security.md)).
 
-## System tools (34)
+## System tools (29)
 
 Offered per request by capability group (files, shell, clock, clipboard, ...).
 
 | Tool | Capability | Effect | Confirms | What it does |
 |---|---|---|---|---|
-| `click_ui_element` | - | refused | no | Click a UI element on the screen by its visible name (button, icon, menu item, etc.) |
 | `clipboard_read` | clipboard | read | no | Read the current clipboard contents |
 | `clipboard_write` | clipboard | local edit | yes | Write text to the clipboard |
 | `copy_file` | files_write | local edit | yes | Copy a file or directory to a new location |
 | `create_directory` | files_write | local edit | yes | Create a new directory (and parent dirs if needed) |
 | `delete_file` | files_write | local edit | yes | Delete a file or directory (recursively for directories) |
 | `find_ui_elements` | screen_elements | read | no | Find all visible UI elements matching a description and return their locations |
-| `focus_window` | apps | refused | no | Bring a window to the foreground by title |
 | `get_datetime` | clock | read | no | Get the current date and time |
 | `get_running_processes` | system | read | no | List running processes, optionally filtered by name |
 | `get_system_info` | system | read | no | Get current system information (CPU, RAM, disk, OS, network) |
@@ -40,12 +38,9 @@ Offered per request by capability group (files, shell, clock, clipboard, ...).
 | `scheduler_delete` | schedule | control | yes | Delete a scheduled Jarvis task |
 | `scheduler_list` | schedule | read | no | List scheduled Jarvis tasks |
 | `search_files` | files_read | read | no | Search for files recursively by name pattern or content |
-| `send_keystrokes` | apps | refused | yes | Send special keys or hotkey combos |
 | `set_volume` | volume | local edit | no | Set system volume (0-100) or mute/unmute |
 | `take_screenshot` | screen | local edit | yes | Take a screenshot and save it to a file |
-| `type_text` | apps | refused | yes | Type text into an app |
 | `web_search` | network | read | no | Search the web for information |
-| `window_management` | apps | refused | yes | Manage application windows: focus, minimize, maximize, or close by title |
 | `write_file` | files_write | local edit | yes | Write content to a file (creates or overwrites) |
 
 ## Browser tools (15)

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from jarvis.agent.inventory import render_tool_table
-from jarvis.agent.permissions import KNOWN_TOOLS, REFUSED_TOOLS, PermissionGateway
+from jarvis.agent.permissions import KNOWN_TOOLS, PermissionGateway
 from jarvis.agent.routing import SYSTEM_CAPABILITIES, Surface, route_request
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.desktop.cua import CuaDesktop, register_desktop_tools
@@ -31,16 +31,24 @@ def test_every_registered_tool_has_a_permission_classification(registries):
     assert not unclassified, f"tools with no permission classification are always denied: {sorted(unclassified)}"
 
 
-def test_every_system_tool_is_reachable_by_routing_or_deliberately_refused(registries):
+def test_every_system_tool_is_reachable_by_routing(registries):
     system = registries[0]
     routed = set().union(*SYSTEM_CAPABILITIES.values())
-    unreachable = set(system.list_tools()) - routed - REFUSED_TOOLS
+    unreachable = set(system.list_tools()) - routed
     assert not unreachable, f"registered but never offered to the model: {sorted(unreachable)}"
 
 
-def test_refused_tools_are_always_denied(tmp_path):
+NO_EXACT_TARGET = ("type_text", "send_keystrokes", "focus_window", "window_management",
+                   "click_ui_element")
+
+
+def test_tools_that_act_without_an_exact_target_do_not_exist(registries, tmp_path):
+    registered = {name for registry in registries for name in registry.list_tools()}
+    assert not registered & set(NO_EXACT_TARGET)
+    offered = set().union(*SYSTEM_CAPABILITIES.values())
+    assert not offered & set(NO_EXACT_TARGET)
     gateway = PermissionGateway(SecurityConfig(allowed_directories=[str(tmp_path)]))
-    for name in sorted(REFUSED_TOOLS):
+    for name in NO_EXACT_TARGET:  # a hallucinated call is still denied, not classified as safe
         assert not gateway.inspect(name, {}).allowed, name
 
 

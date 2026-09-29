@@ -44,10 +44,10 @@ Limitations are important:
 - The shell command tool remains powerful. Its whitelist rejects shell
   compositions and command interpreters, but it is not a process sandbox.
   Catastrophic patterns are blocked even when the whitelist is disabled.
-- Legacy global typing, keystrokes, and title-substring window actions are
-  refused by the gateway because they lack an exact target; use Cua's observed
-  pid/window/snapshot controls. The task CLI's scoped workflows do not use
-  these legacy actions.
+- Global typing, keystrokes, screen-coordinate clicks and title-substring
+  window actions were removed because they act without an exact target. Desktop
+  control goes through Cua's observed pid/window/snapshot tools; with
+  `desktop.backend: legacy`, Jarvis can open applications but cannot drive them.
 - With `allowed_hosts` set, active-page browser actions are currently refused
   until the URL/tab is passed to the gateway. Direct URL navigation is checked
   before dispatch, but redirects and DNS changes are not yet constrained.

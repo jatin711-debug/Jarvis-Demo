@@ -8,7 +8,6 @@ from jarvis.agent.permissions import (
     EXTERNAL_TOOLS,
     LOCAL_TOOLS,
     READ_TOOLS,
-    REFUSED_TOOLS,
 )
 from jarvis.agent.routing import SYSTEM_CAPABILITIES
 from jarvis.agent.tool_registry import ToolRegistry
@@ -26,8 +25,6 @@ _EFFECTS = (
 
 
 def _effect(name: str) -> str:
-    if name in REFUSED_TOOLS:
-        return "refused"
     return next((label for label, names in _EFFECTS if name in names), "unclassified")
 
 
