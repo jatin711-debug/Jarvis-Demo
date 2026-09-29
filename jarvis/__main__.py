@@ -1,100 +1,119 @@
-"""JARVIS entry point — python -m jarvis"""
+"""
+JARVIS entry point: ``python -m jarvis`` or the ``jarvis`` console script.
 
-# ── Fix Windows console Unicode encoding BEFORE any imports ──
+Exit codes: 0 ok, 1 startup failed, 2 invalid configuration, 130 interrupted.
+"""
+
 import os
 import sys
 
+# Quiet native-library chatter. These must be set before the libraries import.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 if sys.platform == "win32":
-    # Force UTF-8 for stdout/stderr to prevent charmap codec errors with emojis
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    os.environ["PYTHONIOENCODING"] = "utf-8"
+    # Child processes started by tools emit UTF-8, which is how their output is decoded.
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-# ── Suppress ALL noisy library warnings BEFORE any imports ──
-
-# Set env vars FIRST - before any imports
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["PYTHONWARNINGS"] = "ignore"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TOKENIZERS_PARALLELISM"] = "0"
-if not sys.warnoptions:
-    os.environ["PYTHONWARNINGS"] = "ignore"
-
-# NOW suppress warnings and logging
 import warnings
 
-warnings.simplefilter("ignore")
-
-import logging
-
-# Suppress all noisy loggers by attaching null handler
-_null_handler = logging.NullHandler()
-for _name in ["tensorflow", "NumExpr", "torch", "transformers",
-              "httpx", "httpcore", "requests"]:
-    _logger = logging.getLogger(_name)
-    _logger.addHandler(_null_handler)
-    _logger.setLevel(50)
+# Dependency deprecation noise is not actionable for users. Other warnings are
+# captured by the logging system (file only unless --verbose).
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import argparse
 import asyncio
-import sys
 
+import yaml
+from pydantic import ValidationError
+
+from jarvis import __version__
 from jarvis.core.orchestrator import Orchestrator
-from jarvis.utils.config import load_config
-from jarvis.utils.logger import get_logger
+from jarvis.utils.config import expand_path, load_config, resolve_config_path
+from jarvis.utils.logger import configure_stdio, get_logger, setup_logging
 
 logger = get_logger(__name__)
 
+EXIT_OK = 0
+EXIT_STARTUP_FAILED = 1
+EXIT_BAD_CONFIG = 2
+EXIT_INTERRUPTED = 130
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="JARVIS — Local Voice AI Assistant")
-    parser.add_argument(
-        "--config", type=str, default=None,
-        help="Path to config.yaml (default: auto-detect)"
-    )
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="jarvis", description="JARVIS - local voice AI assistant")
+    parser.add_argument("--config", type=str, default=None,
+                        help="path to config.yaml (default: auto-detect)")
     parser.add_argument("--text", type=str, default=None,
-                        help="Run one text turn without microphone, wake word, or speech output")
-    return parser.parse_args()
+                        help="run one text turn without microphone, wake word, or speech output")
+    parser.add_argument("--list-tools", action="store_true",
+                        help="print every tool by surface, effect and confirmation, then exit")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="show DEBUG diagnostics on the console (the log file always has them)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args(argv)
+    if args.text is not None and not args.text.strip():
+        parser.error("--text must be non-empty")
+    return args
 
 
-async def main() -> None:
-    """Boot Jarvis voice assistant."""
-    args = parse_args()
+async def main(argv: list[str] | None = None) -> int:
+    """Boot Jarvis; returns the process exit code."""
+    args = parse_args(argv)
 
-    logger.info("🚀 Starting JARVIS v0.2.0 ...")
+    try:
+        config = load_config(args.config)
+    except (OSError, yaml.YAMLError, ValidationError) as exc:
+        # Logging is not configured yet, so report directly.
+        print(f"jarvis: cannot load configuration: {exc}", file=sys.stderr)
+        return EXIT_BAD_CONFIG
 
-    config = load_config(args.config)
-    logger.info("✅ Configuration loaded")
+    if args.list_tools:
+        from jarvis.agent.inventory import render_tool_table
+
+        print(render_tool_table(config), end="")
+        return EXIT_OK
+
+    setup_logging(
+        level="DEBUG" if args.verbose else config.system.log_level,
+        log_dir=str(expand_path(config.system.log_dir)),
+    )
+    logger.info("starting jarvis version=%s config=%s", __version__,
+                resolve_config_path(args.config) or "defaults")
 
     orchestrator = Orchestrator(config)
+    exit_code = EXIT_OK
     try:
-        await orchestrator.startup(voice_enabled=args.text is None)
+        try:
+            await orchestrator.startup(voice_enabled=args.text is None)
+        except RuntimeError as exc:
+            # Preflight failures (Ollama down, model not pulled, ...) fail fast
+            # with an actionable message instead of booting into broken turns.
+            logger.error("startup failed: %s", exc)
+            return EXIT_STARTUP_FAILED
+
         if args.text is None:
             await orchestrator.run()
         else:
-            if not args.text.strip():
-                raise ValueError("--text must be non-empty")
-            print(await orchestrator._handle_user_message(args.text))
-    except RuntimeError as e:
-        # Preflight failures (Ollama down, model not pulled, ...) — fail fast
-        # with an actionable message instead of booting into broken turns.
-        logger.error("❌ Startup preflight failed: %s", e)
-        sys.exit(1)
-
-    except KeyboardInterrupt:
-        logger.info("🛑 Shutdown requested by user")
+            print(await orchestrator.ask(args.text))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("interrupted by user")
+        exit_code = EXIT_INTERRUPTED
     finally:
         await orchestrator.shutdown()
-        logger.info("👋 JARVIS stopped. Goodbye!")
+        logger.info("goodbye")
+    return exit_code
 
 
 def cli() -> None:
     """Console-script entry point (``jarvis`` command)."""
+    configure_stdio()
     try:
-        asyncio.run(main())
+        code = asyncio.run(main())
     except KeyboardInterrupt:
-        sys.exit(0)
+        code = EXIT_INTERRUPTED
+    sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -9,13 +9,13 @@ import pytest
 from jarvis.agent.permissions import KNOWN_TOOLS, PermissionGateway
 from jarvis.agent.react_agent import ReActAgent
 from jarvis.agent.tool_registry import ToolRegistry
-from jarvis.core.orchestrator import _is_explicit_yes
 from jarvis.desktop.cua import register_desktop_tools
 from jarvis.tasks.runner import TaskRunner
 from jarvis.tasks.store import TaskStore
 from jarvis.tools.browser_tools import register_browser_tools
 from jarvis.tools.system_tools import register_system_tools
 from jarvis.utils.config import SecurityConfig
+from jarvis.voice.transcript import is_explicit_yes
 
 
 def policy(tmp_path: Path, **overrides) -> PermissionGateway:
@@ -194,7 +194,7 @@ def test_confirmation_fingerprint_covers_content(tmp_path):
     ("yesterday", False), ("no", False), ("okay", False),
 ])
 def test_voice_approval_requires_exact_yes(heard, approved):
-    assert _is_explicit_yes(heard) is approved
+    assert is_explicit_yes(heard) is approved
 
 
 def test_all_builtin_tools_have_permission_classification():
