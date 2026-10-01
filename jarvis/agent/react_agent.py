@@ -20,8 +20,6 @@ One request flows through four stages:
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import logging
 import re
@@ -51,6 +49,7 @@ from jarvis.agent.tool_registry import (
     ToolDefinition,
     ToolRegistry,
 )
+from jarvis.tools.vision_tools import capture_screen_b64
 from jarvis.utils.deadlines import wait_with_progress
 from jarvis.utils.logger import get_logger
 
@@ -269,24 +268,13 @@ class ReActAgent:
             used += size
         return history
 
-    @staticmethod
-    def _grab_screenshot() -> str:
-        """Capture the screen, downsize for the vision model, return base64 PNG (blocking)."""
-        import pyautogui
-        img = pyautogui.screenshot()
-        # Downsize to reduce vision encoder latency (~60-70% smaller payload)
-        img = img.resize((672, 448))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        return base64.b64encode(buf.getvalue()).decode()
-
     async def _capture_screenshot(self) -> list[str] | None:
         """Screenshot for a vision turn, taken off the event loop; None if unavailable."""
         if not getattr(self.llm, "supports_images", True):
             logger.warning("screenshot skipped: the configured model provider cannot read images")
             return None
         try:
-            b64 = await asyncio.to_thread(self._grab_screenshot)
+            b64 = await asyncio.to_thread(capture_screen_b64)
         except Exception as e:
             logger.warning("screenshot failed error=%s", e)
             return None

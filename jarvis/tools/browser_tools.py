@@ -16,6 +16,17 @@ from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# How long to wait for a page to settle after an action that has already happened.
+LOAD_TIMEOUT_MS = 10000
+# Ambiguous clicks: how many matches to look at, and how many to show the model.
+MAX_SCAN = 20
+MAX_CANDIDATES = 5
+
+
+def _is_timeout(error: BaseException) -> bool:
+    """True for a Playwright (or builtin) timeout, without importing playwright."""
+    return any(cls.__name__ == "TimeoutError" for cls in type(error).__mro__)
+
 
 class BrowserSession:
     """
@@ -30,18 +41,56 @@ class BrowserSession:
         self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def is_running(self) -> bool:
         return self._page is not None and not self._page.is_closed()
 
+    def _startup_lock(self) -> asyncio.Lock:
+        # Created lazily so it belongs to the loop that actually uses it.
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock, self._lock_loop = asyncio.Lock(), loop
+        return self._lock
+
     async def _ensure_browser(self) -> None:
-        """Launch browser on first use (lazy init)."""
+        """Make sure there is an active page, launching a browser only if none is alive.
+
+        Startup is serialised. If it fails or is cancelled (barge-in), whatever was
+        already started is stopped before the error propagates, so nothing is orphaned.
+        """
         if self.is_running:
             return
+        async with self._startup_lock():
+            if self.is_running:
+                return
+            try:
+                if not await self._reuse_browser():
+                    await self._launch()
+            except BaseException:
+                await self._teardown()
+                raise
 
+    async def _reuse_browser(self) -> bool:
+        """Open a fresh tab in the browser we already have, if it is still connected."""
+        browser, context = self._browser, self._context
+        if browser is None or context is None or not browser.is_connected():
+            return False
+        try:
+            self._page = await context.new_page()
+        except Exception as e:
+            logger.warning("browser reuse failed error=%s", e)
+            return False
+        logger.info("browser reused")
+        return True
+
+    async def _launch(self) -> None:
         from playwright.async_api import async_playwright
 
+        # Handles left by a dead browser still own a driver process; stop it first.
+        await self._teardown()
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=False,
@@ -62,24 +111,54 @@ class BrowserSession:
     def page(self) -> Any:
         return self._page
 
-    async def shutdown(self) -> None:
-        """Close browser and clean up."""
-        was_open = self._playwright is not None
+    def adopt_new_tab(self, tabs_before: list[Any]) -> Any | None:
+        """Make a tab opened since ``tabs_before`` (popup, target=_blank) the active page."""
+        if self._context is None:
+            return None
+        fresh = [p for p in self._context.pages if p not in tabs_before and not p.is_closed()]
+        if not fresh:
+            return None
+        self._page = fresh[-1]
+        return self._page
+
+    async def _teardown(self) -> list[str]:
+        """Close context, browser and driver independently; always drop the handles.
+
+        Returns the steps that failed. Each later step runs even if an earlier one
+        raised or the task was cancelled, so one failure never leaks the driver.
+        """
+        context, browser, playwright = self._context, self._browser, self._playwright
+        self._page = self._context = self._browser = self._playwright = None
+        failed: list[str] = []
+
+        async def close(step: str, handle: Any, method: str) -> None:
+            if handle is None:
+                return
+            try:
+                await getattr(handle, method)()
+            except Exception as e:
+                failed.append(step)
+                logger.warning("browser cleanup failed step=%s error=%s", step, e)
+
         try:
-            if self._context:
-                await self._context.close()
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
-        except Exception as e:
-            logger.warning("browser cleanup failed error=%s", e)
-        self._page = None
-        self._context = None
-        self._browser = None
-        self._playwright = None
+            await close("context", context, "close")
+        finally:
+            try:
+                await close("browser", browser, "close")
+            finally:
+                await close("playwright", playwright, "stop")
+        return failed
+
+    async def shutdown(self) -> list[str]:
+        """Close browser and clean up. Returns the cleanup steps that failed (empty = clean)."""
+        was_open = any(h is not None for h in (self._playwright, self._browser, self._context))
+        failed = await self._teardown()
         if was_open:
-            logger.info("browser closed")
+            if failed:
+                logger.warning("browser closed with errors steps=%s", ",".join(failed))
+            else:
+                logger.info("browser closed")
+        return failed
 
 
 # Module-level singleton so all tools share the same session
@@ -89,6 +168,101 @@ _session = BrowserSession()
 async def shutdown_browser() -> None:
     """Called by Orchestrator on shutdown."""
     await _session.shutdown()
+
+
+def _caveat(error: Exception) -> str:
+    """Note for the model when an action happened but the page could not be confirmed."""
+    if _is_timeout(error):
+        return (
+            f"the page is still loading after {LOAD_TIMEOUT_MS // 1000}s; "
+            "the action was performed, do not repeat it"
+        )
+    return (
+        f"could not confirm the page state afterwards ({error}); "
+        "the action was performed, do not repeat it"
+    )
+
+
+async def _settle(page: Any) -> str:
+    """Wait for the page after an action that has already happened.
+
+    Returns "" once the page has loaded, otherwise a note for the model. Never raises:
+    the click or keypress was performed, so a slow page must not be reported as a failed
+    action (the model would retry it and repeat the side effect).
+    """
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=LOAD_TIMEOUT_MS)
+    except Exception as e:
+        return _caveat(e)
+    return ""
+
+
+async def _describe(page: Any, performed: str, note: str = "") -> str:
+    """Report an action that was performed, plus the page it left us on."""
+    title: str | None = None
+    if not note:
+        try:
+            title = await page.title()
+        except Exception as e:
+            note = _caveat(e)
+    lines = [performed]
+    if title is not None:
+        lines.append(f"Page: {title}")
+    lines.append(f"URL: {page.url}")
+    if note:
+        lines.append(f"Note: {note}")
+    return "\n".join(lines)
+
+
+async def _finish_click(performed: str, tabs_before: list[Any]) -> str:
+    page = _session.page
+    note = await _settle(page)
+    popup = _session.adopt_new_tab(tabs_before)
+    if popup is not None:
+        page = popup
+        performed += "\nThe click opened a new tab, which is now the active tab."
+        note = await _settle(page)
+    return await _describe(page, performed, note)
+
+
+async def _finish_typing(page: Any, message: str, pressed_enter: bool) -> str:
+    # Typing and Enter already happened; a slow page must not read as a failure.
+    if not pressed_enter:
+        return message
+    message += " and pressed Enter"
+    note = await _settle(page)
+    return f"{message}\nNote: {note}" if note else message
+
+
+async def _visible_matches(locator: Any) -> tuple[list[Any], int]:
+    """The visible elements among the first MAX_SCAN matches, and the total match count."""
+    total = await locator.count()
+    visible = []
+    for i in range(min(total, MAX_SCAN)):
+        el = locator.nth(i)
+        if await el.is_visible():
+            visible.append(el)
+    return visible, total
+
+
+async def _ambiguous_click(selector: str, visible: list[Any]) -> str:
+    texts = []
+    for el in visible[:MAX_CANDIDATES]:
+        try:
+            text = " ".join((await el.inner_text(timeout=2000)).split())
+        except Exception:
+            text = ""
+        texts.append(text[:60] or "(no text)")
+    lines = [f"Nothing was clicked: '{selector}' matches more than one visible element."]
+    lines.append("Candidates:")
+    lines.extend(f"  {i}. {text}" for i, text in enumerate(texts, 1))
+    if len(visible) > MAX_CANDIDATES:
+        lines.append("  ...")
+    lines.append(
+        "Use a more specific selector: longer or exact visible text, "
+        "or a CSS selector such as '#id' or 'a[href=\"...\"]'."
+    )
+    return "\n".join(lines)
 
 
 def register_browser_tools(registry: ToolRegistry) -> None:
@@ -211,34 +385,28 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
-            # Try as text first, then as CSS selector
-            el = page.get_by_text(selector, exact=False).first
-            if await el.count() > 0 and await el.is_visible():
-                await el.click(timeout=5000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                title = await page.title()
-                return f"Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
-
-            # Try as role-based
-            el = page.get_by_role("link", name=selector).first
-            if await el.count() > 0 and await el.is_visible():
-                await el.click(timeout=5000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                title = await page.title()
-                return f"Clicked link '{selector}'\nPage: {title}\nURL: {page.url}"
-
-            el = page.get_by_role("button", name=selector).first
-            if await el.count() > 0 and await el.is_visible():
-                await el.click(timeout=5000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                title = await page.title()
-                return f"Clicked button '{selector}'\nPage: {title}\nURL: {page.url}"
+            tabs_before = list(_session._context.pages)
+            # Visible text (exact first, then substring), then link/button names, then
+            # a CSS selector. A text match must be unique: clicking the first of
+            # several is a guess, and a wrong click can be an irreversible action.
+            strategies = (
+                ("", page.get_by_text(selector, exact=True)),
+                ("", page.get_by_text(selector, exact=False)),
+                ("link ", page.get_by_role("link", name=selector)),
+                ("button ", page.get_by_role("button", name=selector)),
+            )
+            for kind, locator in strategies:
+                visible, total = await _visible_matches(locator)
+                if not visible:
+                    continue
+                if len(visible) > 1 or total > MAX_SCAN:
+                    return await _ambiguous_click(selector, visible)
+                await visible[0].click(timeout=5000)
+                return await _finish_click(f"Clicked {kind}'{selector}'", tabs_before)
 
             # Fall through to CSS selector
             await page.click(selector, timeout=5000)
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            title = await page.title()
-            return f"Clicked '{selector}'\nPage: {title}\nURL: {page.url}"
+            return await _finish_click(f"Clicked '{selector}'", tabs_before)
         except Exception as e:
             return f"Click failed for '{selector}': {e}"
 
@@ -286,8 +454,7 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 await el.fill(text)
                 if press_enter:
                     await el.press("Enter")
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return f"Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
+                return await _finish_typing(page, f"Typed '{text}' into field '{selector}'", press_enter)
 
             # Try as label
             el = page.get_by_label(selector, exact=False).first
@@ -296,15 +463,13 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 await el.fill(text)
                 if press_enter:
                     await el.press("Enter")
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return f"Typed '{text}' into field '{selector}'" + (" and pressed Enter" if press_enter else "")
+                return await _finish_typing(page, f"Typed '{text}' into field '{selector}'", press_enter)
 
             # Fall through to CSS selector
             await page.fill(selector, text, timeout=5000)
             if press_enter:
                 await page.press(selector, "Enter")
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            return f"Typed '{text}' into '{selector}'" + (" and pressed Enter" if press_enter else "")
+            return await _finish_typing(page, f"Typed '{text}' into '{selector}'", press_enter)
         except Exception as e:
             return f"Type failed for '{selector}': {e}"
 
@@ -370,14 +535,19 @@ def register_browser_tools(registry: ToolRegistry) -> None:
         },
     )
     async def browser_scroll(direction: str, amount: int = 500) -> str:
+        way = str(direction).strip().lower()
+        if way not in ("up", "down"):
+            return f"Invalid scroll direction '{direction}': use 'up' or 'down'. Nothing was scrolled."
+        if amount <= 0:
+            return f"Invalid scroll amount {amount}: use a positive number of pixels."
         if not _session.is_running:
             return "Browser not open. Use browser_navigate first."
         try:
             page = _session.page
-            delta = amount if direction.lower() == "down" else -amount
+            delta = amount if way == "down" else -amount
             await page.mouse.wheel(0, delta)
             await asyncio.sleep(0.3)  # let page settle
-            return f"Scrolled {direction} by {amount}px"
+            return f"Scrolled {way} by {amount}px"
         except Exception as e:
             return f"Scroll failed: {e}"
 
@@ -587,7 +757,12 @@ def register_browser_tools(registry: ToolRegistry) -> None:
     )
     async def browser_close() -> str:
         try:
-            await _session.shutdown()
+            failed = await _session.shutdown()
+            if failed:
+                return (
+                    f"Browser close was incomplete (failed: {', '.join(failed)}). "
+                    "A browser process may still be running."
+                )
             return "Browser closed"
         except Exception as e:
             return f"Failed to close browser: {e}"
@@ -637,8 +812,13 @@ def register_browser_tools(registry: ToolRegistry) -> None:
                 except Exception:
                     continue
 
-            summary = "\n".join(results) if results else "Results loaded."
-            return f"YouTube results for '{query}':\n{summary}\nURL: {page.url}"
+            if not results:
+                return (
+                    f"Submitted the YouTube search for '{query}' but could not read any video "
+                    "titles (the page may be a consent prompt, or YouTube's layout changed). "
+                    f"URL: {page.url}\nUse browser_read_page or browser_screenshot to see it."
+                )
+            return f"YouTube results for '{query}':\n" + "\n".join(results) + f"\nURL: {page.url}"
         except Exception as e:
             return f"YouTube search failed: {e}"
 

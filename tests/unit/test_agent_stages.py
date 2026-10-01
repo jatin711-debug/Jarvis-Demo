@@ -107,7 +107,7 @@ class TestVision:
         llm.supports_images = False
         agent = ReActAgent(llm, make_tools(), "sys")
         grabbed = []
-        monkeypatch.setattr(ReActAgent, "_grab_screenshot", staticmethod(lambda: grabbed.append(1)))
+        monkeypatch.setattr("jarvis.agent.react_agent.capture_screen_b64", lambda: grabbed.append(1))
         await agent.run("take a screenshot and tell me what you see")
         assert not grabbed
         assert llm.requests[0]["images"] is None
@@ -125,7 +125,7 @@ class TestVision:
             time.sleep(0.2)
             return "b64"
 
-        monkeypatch.setattr(ReActAgent, "_grab_screenshot", staticmethod(slow_grab))
+        monkeypatch.setattr("jarvis.agent.react_agent.capture_screen_b64", slow_grab)
         agent = ReActAgent(ScriptedLLM([]), make_tools(), "sys")
         ticks = 0
 
