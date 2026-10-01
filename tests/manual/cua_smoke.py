@@ -27,7 +27,7 @@ async def main():
                 [sys.executable, "-m", "jarvis.tasks", "--db", str(db_path), *args],
                 capture_output=True, text=True, timeout=60,
             )
-            if process_result.returncode not in (0, 2):
+            if process_result.returncode not in (0, 3):  # 3 = ended in needs_review
                 raise RuntimeError(process_result.stderr or process_result.stdout)
             return json.loads(process_result.stdout)
 

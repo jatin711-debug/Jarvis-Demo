@@ -16,7 +16,26 @@ Use `--db PATH` to direct it to a test database. Its commands are `list`,
 `status TASK_ID`, `cancel TASK_ID`, and `resume TASK_ID`. Progress lines
 (`task step verified id=... step=... n=2/4`) go to stderr with the task id
 shortened to 8 characters; task input is never logged, only its length. The
-JSON result goes to stdout. The exit code is 2 when a run ends in `needs_review`.
+JSON result goes to stdout as a single UTF-8 document, even when stdout is a
+pipe. The `start-*` commands log `task created id=...` with the full id (the one
+`status`, `resume`, and `cancel` take) as soon as the record exists.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success: the result was printed (a run that completed, paused, or was cancelled; `list`, `status`, `cancel`) |
+| 1 | The command failed, for example the desktop backend would not start or another process changed the task |
+| 2 | Usage error: bad arguments (`--max-seconds`/`--max-actions` must be positive, `--pause-after` at least 1), an unknown task ID, or an unreadable `--config` |
+| 3 | `start-*` or `resume` ran and ended in `needs_review` |
+| 130 | Interrupted |
+
+`needs_review` used to share code 2 with usage errors; scripts should now test
+for 3. Errors print one `jarvis.tasks: ...` line on stderr, never a traceback.
+If the desktop backend fails to start, a task that was still `pending` is marked
+`needs_review` with the error (a `startup_failed` event) instead of staying
+`pending`; fix the problem and run `resume ID`. A `paused` task is left as it
+was.
 
 The first supported workflow controls only an existing, uniquely named
 `Jarvis Cua Smoke ...` test window created by `tests/manual/cua_fixture.ps1`.

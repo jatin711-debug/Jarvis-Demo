@@ -20,6 +20,8 @@ dependencies = [
     # Memory
     "mem0ai>=0.1.0",
     "chromadb>=0.5.0",
+    # mem0's Ollama embedder and LLM import it, but mem0ai lists it only in an extra
+    "ollama>=0.3.0",
     # Voice: STT
     "faster-whisper>=1.0.0",
     "sounddevice>=0.4.6",
@@ -42,7 +44,6 @@ dependencies = [
     "playwright>=1.40",
     # Vision & document reading
     "pdfplumber>=0.11.0",
-    "PyPDF2>=3.0.0",
     "pandas>=2.0.0",
     "openpyxl>=3.1.0",
 ]
