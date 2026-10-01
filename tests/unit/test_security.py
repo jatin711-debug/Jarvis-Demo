@@ -1,11 +1,9 @@
 """Unit tests for the shell-command security gate in jarvis.tools.system_tools."""
 
+from jarvis.agent.permissions import catastrophic_reason as _catastrophic_reason
+from jarvis.agent.permissions import first_executable as _first_executable
 from jarvis.agent.tool_registry import ToolRegistry
-from jarvis.tools.system_tools import (
-    _catastrophic_reason,
-    _first_executable,
-    register_system_tools,
-)
+from jarvis.tools.system_tools import register_system_tools
 from jarvis.utils.config import SecurityConfig
 
 

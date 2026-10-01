@@ -22,7 +22,7 @@ Offered per request by capability group (files, shell, clock, clipboard, ...).
 | `get_datetime` | clock | read | no | Get the current date and time |
 | `get_running_processes` | system | read | no | List running processes, optionally filtered by name |
 | `get_system_info` | system | read | no | Get current system information (CPU, RAM, disk, OS, network) |
-| `get_uptime` | system | read | no | Get system uptime and load averages |
+| `get_uptime` | system | read | no | Get how long the system has been running since boot |
 | `http_request` | network | outward | no | Make HTTP requests (GET, POST, PUT, DELETE) |
 | `kill_process` | process | control | yes | Kill a running process by PID or name |
 | `list_directory` | files_read | read | no | List files and folders in a directory |

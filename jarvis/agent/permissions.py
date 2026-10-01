@@ -41,6 +41,65 @@ def catastrophic_reason(command: str) -> str | None:
         return "modifies boot configuration"
     return None
 
+
+_SHELL_COMPOSITION = re.compile(r"[\r\n;&|><`]|\$\(|%[^%]+%")
+_INTERPRETERS = frozenset({"cmd", "powershell", "pwsh", "bash", "sh", "python", "py", "node"})
+_SCRIPT_EXTENSIONS = (".exe", ".bat", ".cmd", ".ps1", ".com")
+
+
+def _executable_token(command: str) -> str:
+    """The command's first word, honoring a quoted path that contains spaces."""
+    text = command.strip()
+    if text[:1] in {'"', "'"}:
+        end = text.find(text[0], 1)
+        return text[1:end] if end > 0 else text[1:]
+    return text.split(maxsplit=1)[0] if text else ""
+
+
+def first_executable(command: str) -> str:
+    """Lower-case base name of the command's executable, without a script extension."""
+    base = ntpath.basename(_executable_token(command)).lower()
+    for ext in _SCRIPT_EXTENSIONS:
+        if base.endswith(ext):
+            return base[: -len(ext)]
+    return base
+
+
+def validate_command(security: SecurityConfig, raw: Any) -> str:
+    """The one policy for shell commands: return the command or raise ValueError.
+
+    The message is shown to the model and the user, so it names the rule that
+    refused the command. Both the permission gateway and the ``run_command``
+    handler call this, so they cannot drift apart.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("An exact command is required")
+    command = raw.strip()
+    reason = catastrophic_reason(command)
+    if reason:
+        raise ValueError(f"Blocked: this command {reason}. Run it manually if you really mean it")
+    folded = command.casefold()
+    for blocked in security.blocked_commands:
+        if blocked and blocked.casefold() in folded:
+            raise ValueError(f"Blocked by security.blocked_commands: '{blocked}'")
+    if security.command_whitelist:
+        # A first-executable whitelist cannot classify shell compositions or
+        # interpreter arguments as independent commands, so refuse them.
+        if _SHELL_COMPOSITION.search(command):
+            raise ValueError("Shell compositions are not allowed while the command whitelist is on")
+        executable = first_executable(command)
+        if executable in _INTERPRETERS:
+            raise ValueError("Command interpreters cannot be constrained by a first-executable "
+                             "whitelist")
+        if re.search(r"[\\/]", _executable_token(command)):
+            raise ValueError(f"Run '{executable}' by name, not by path, while the command "
+                             "whitelist is on")
+        if executable not in {a.casefold() for a in security.allowed_commands}:
+            raise ValueError(f"'{executable}' is not in the command whitelist. Add it to "
+                             "security.allowed_commands to allow it")
+    return command
+
+
 READ_TOOLS = frozenset({
     "read_file", "list_directory", "search_files", "get_system_info", "get_running_processes",
     "get_datetime", "get_uptime", "clipboard_read", "scheduler_list", "web_search",
@@ -145,26 +204,7 @@ class PermissionGateway:
         return name
 
     def _command(self, raw: str) -> str:
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("An exact command is required")
-        command = raw.strip()
-        reason = catastrophic_reason(command)
-        if reason:
-            raise ValueError(f"Command {reason}")
-        if any(block.casefold() in command.casefold() for block in self.security.blocked_commands if block):
-            raise ValueError("Command matches security.blocked_commands")
-        if self.security.command_whitelist:
-            # A first-executable whitelist cannot safely classify shell
-            # compositions or interpreter arguments as independent commands.
-            if re.search(r"[\r\n;&|><`]|\$\(|%[^%]+%", command):
-                raise ValueError("Shell compositions are not allowed with command_whitelist enabled")
-            executable = ntpath.basename(command.split()[0].strip("\"'")).casefold()
-            executable = re.sub(r"\.(exe|cmd|bat|ps1|com)$", "", executable)
-            if executable in {"cmd", "powershell", "pwsh", "bash", "sh", "python", "py", "node"}:
-                raise ValueError("Command interpreters cannot be constrained by a first-executable whitelist")
-            if executable not in {a.casefold() for a in self.security.allowed_commands}:
-                raise ValueError(f"Command is outside security.allowed_commands: {executable}")
-        return command
+        return validate_command(self.security, raw)
 
     def inspect(self, name: str, args: dict[str, Any], *, tool_requires_confirmation: bool = False
                 ) -> PermissionDecision:

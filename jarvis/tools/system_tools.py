@@ -8,34 +8,92 @@ Dispatch is subject to the configured permission gateway.
 from __future__ import annotations
 
 import asyncio
-import ntpath
+import contextlib
+import functools
 import os
 import platform
 import shutil
 import subprocess
+import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import psutil
 
-from jarvis.agent.permissions import catastrophic_reason as _catastrophic_reason
+from jarvis.agent.permissions import validate_command
 from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.config import SecurityConfig
 from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-def _first_executable(command: str) -> str:
-    """Extract the base executable name from a shell command line."""
-    first = command.strip().split()[0] if command.strip() else ""
-    # Strip quotes and path, keep basename without extension
-    first = first.strip("\"'")
-    base = ntpath.basename(first).lower()
-    for ext in (".exe", ".bat", ".cmd", ".ps1", ".com"):
-        if base.endswith(ext):
-            base = base[: -len(ext)]
-    return base
+# Limits that keep a single tool call from stalling the assistant.
+_COMMAND_TIMEOUT_S = 120.0
+_READ_LIMIT_CHARS = 50_000
+_SEARCH_MAX_RESULTS = 100
+_SEARCH_MAX_CONTENT_BYTES = 2_000_000  # larger files are matched by name only
+_SEARCH_TIME_BUDGET_S = 20.0
+
+
+def _offloaded(fn: Callable[..., str]) -> Callable[..., Any]:
+    """Run a blocking tool body on a worker thread.
+
+    Tool handlers run on the event loop that also drives audio capture and
+    barge-in, so file, process, and subprocess work must not run there.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return wrapper
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and everything it started (best effort)."""
+    try:
+        parent = psutil.Process(pid)
+        doomed = [*parent.children(recursive=True), parent]
+    except psutil.Error:
+        return
+    for proc in doomed:
+        with contextlib.suppress(psutil.Error):
+            proc.kill()
+
+
+async def _run_shell(command: str, timeout: float) -> tuple[int, bytes, bytes]:
+    """Run a shell command and return ``(exit_code, stdout, stderr)``.
+
+    On timeout or cancellation the whole process tree is killed, so a hung or
+    abandoned command never keeps running in the background.
+    """
+    proc = await asyncio.create_subprocess_shell(
+        command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout, stderr
+    except BaseException:
+        _kill_process_tree(proc.pid)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        raise
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Replace ``path`` with ``content`` so a crash never leaves a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        if path.exists():
+            with contextlib.suppress(OSError):
+                shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def register_system_tools(
@@ -44,27 +102,6 @@ def register_system_tools(
     llm_client: Any = None,
 ) -> None:
     """Register all built-in system tools."""
-
-    def _command_allowed(command: str) -> str | None:
-        """Security gate for run_command. Returns refusal reason or None."""
-        reason = _catastrophic_reason(command)
-        if reason:
-            return f"Blocked: this command {reason}. Run it manually if you really mean it."
-
-        lowered = command.lower()
-        for blocked in security.blocked_commands:
-            if blocked and blocked.lower() in lowered:
-                return f"Blocked by config blocklist: '{blocked}'"
-
-        if security.command_whitelist:
-            exe = _first_executable(command)
-            allowed = {a.lower() for a in security.allowed_commands}
-            if exe not in allowed:
-                return (
-                    f"'{exe}' is not in the command whitelist. "
-                    "Add it to security.allowed_commands in config.yaml to allow it."
-                )
-        return None
 
     # ── Shell Command Execution ──
 
@@ -84,28 +121,26 @@ def register_system_tools(
         requires_confirmation=True,
     )
     async def run_command(command: str) -> str:
-        refusal = _command_allowed(command)
-        if refusal:
-            logger.warning("command blocked command=%r reason=%s", command, refusal)
-            return refusal
         try:
-            result = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                result.communicate(), timeout=120,
-            )
-            output = stdout.decode("utf-8", errors="replace").strip()
-            errors = stderr.decode("utf-8", errors="replace").strip()
-            if errors:
-                output += f"\n[stderr]: {errors}"
-            return output or "(no output)"
+            validate_command(security, command)
+        except ValueError as refusal:
+            logger.warning("command blocked command=%r reason=%s", command, refusal)
+            return str(refusal)
+        try:
+            code, stdout, stderr = await _run_shell(command, _COMMAND_TIMEOUT_S)
         except TimeoutError:
-            return "Command timed out after 120 seconds."
+            logger.warning("command stopped after timeout=%gs command=%r",
+                           _COMMAND_TIMEOUT_S, command)
+            return f"Command timed out after {_COMMAND_TIMEOUT_S:g} seconds and was stopped."
         except Exception as e:
             return f"Error: {e}"
+        output = stdout.decode("utf-8", errors="replace").strip()
+        errors = stderr.decode("utf-8", errors="replace").strip()
+        if errors:
+            output += f"\n[stderr]: {errors}"
+        if code != 0:
+            output += f"\n[exit code: {code}]"
+        return output.strip() or "(no output)"
 
     # ── App name aliases (used by open_application) ──
     _WIN_ALIASES: dict[str, str] = {
@@ -260,7 +295,7 @@ def register_system_tools(
     async def open_application(app_name: str) -> str:
         try:
             if platform.system() == "Windows":
-                resolved = _resolve_app_windows(app_name)
+                resolved = await asyncio.to_thread(_resolve_app_windows, app_name)
                 if resolved is None:
                     return (
                         f"Could not find an application named '{app_name}'. "
@@ -293,16 +328,20 @@ def register_system_tools(
             "required": ["file_path"],
         },
     )
-    async def read_file(file_path: str) -> str:
+    @_offloaded
+    def read_file(file_path: str) -> str:
         path = Path(file_path).expanduser().resolve()
         if not path.exists():
             return f"File not found: {path}"
         if not path.is_file():
             return f"Not a file: {path}"
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-            if len(content) > 50000:
-                return content[:50000] + f"\n\n... (truncated, {len(content)} total chars)"
+            # Read only what can be returned; a huge file is never loaded whole.
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(_READ_LIMIT_CHARS + 1)
+            if len(content) > _READ_LIMIT_CHARS:
+                return (content[:_READ_LIMIT_CHARS]
+                        + f"\n\n... (truncated; file is {path.stat().st_size:,} bytes)")
             return content
         except Exception as e:
             return f"Error reading file: {e}"
@@ -327,11 +366,11 @@ def register_system_tools(
             "required": ["file_path", "content"],
         },
     )
-    async def write_file(file_path: str, content: str) -> str:
+    @_offloaded
+    def write_file(file_path: str, content: str) -> str:
         path = Path(file_path).expanduser().resolve()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            _write_atomic(path, content)
             return f"Written {len(content)} chars to {path}"
         except Exception as e:
             return f"Error writing file: {e}"
@@ -352,7 +391,8 @@ def register_system_tools(
             "required": ["path"],
         },
     )
-    async def list_directory(path: str) -> str:
+    @_offloaded
+    def list_directory(path: str) -> str:
         path = Path(path).expanduser().resolve()
         if not path.exists():
             return f"Directory not found: {path}"
@@ -388,7 +428,8 @@ def register_system_tools(
             "properties": {},
         },
     )
-    async def get_system_info() -> str:
+    @_offloaded
+    def get_system_info() -> str:
         try:
             cpu_percent = psutil.cpu_percent(interval=0.5)
             memory = psutil.virtual_memory()
@@ -427,10 +468,12 @@ def register_system_tools(
             "required": ["url"],
         },
     )
-    async def open_url(url: str) -> str:
+    @_offloaded
+    def open_url(url: str) -> str:
         import webbrowser
         try:
-            webbrowser.open(url)
+            if not webbrowser.open(url):
+                return f"No browser accepted {url}; nothing was opened."
             return f"Opened {url} in browser"
         except Exception as e:
             return f"Error opening URL: {e}"
@@ -459,35 +502,51 @@ def register_system_tools(
             "required": ["directory", "pattern"],
         },
     )
-    async def search_files(directory: str, pattern: str, content: str = "") -> str:
+    @_offloaded
+    def search_files(directory: str, pattern: str, content: str = "") -> str:
         import fnmatch
         root = Path(directory).expanduser().resolve()
         if not root.exists():
             return f"Directory not found: {root}"
-        matches = []
-        try:
-            for path in root.rglob("*"):
-                if len(matches) >= 100:
+        wanted = pattern.lower()
+        needle = content.lower()
+        deadline = time.monotonic() + _SEARCH_TIME_BUDGET_S
+        matches: list[str] = []
+        timed_out = False
+
+        def contains(path: Path) -> bool:
+            try:
+                if path.stat().st_size > _SEARCH_MAX_CONTENT_BYTES:
+                    return False
+                return needle in path.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                return False
+
+        for dirpath, _dirs, names in os.walk(root):
+            for name in names:
+                if time.monotonic() > deadline:
+                    timed_out = True
                     break
-                if not path.is_file():
+                if not fnmatch.fnmatch(name.lower(), wanted):
                     continue
-                if not fnmatch.fnmatch(path.name.lower(), pattern.lower()):
+                path = Path(dirpath) / name
+                if needle and not contains(path):
                     continue
-                if content:
-                    try:
-                        text = path.read_text(encoding="utf-8", errors="replace")
-                        if content.lower() not in text.lower():
-                            continue
-                    except (OSError, UnicodeDecodeError):
-                        continue
                 matches.append(str(path))
-        except PermissionError:
-            pass
+                if len(matches) >= _SEARCH_MAX_RESULTS:
+                    break
+            else:
+                continue
+            break
+
         if not matches:
-            return f"No files matching '{pattern}' found in {root}"
+            note = f" (search stopped after {_SEARCH_TIME_BUDGET_S:g}s)" if timed_out else ""
+            return f"No files matching '{pattern}' found in {root}{note}"
         result = "\n".join(matches)
-        if len(matches) >= 100:
-            result += "\n... (capped at 100 results)"
+        if len(matches) >= _SEARCH_MAX_RESULTS:
+            result += f"\n... (capped at {_SEARCH_MAX_RESULTS} results)"
+        if timed_out:
+            result += f"\n... (search stopped after {_SEARCH_TIME_BUDGET_S:g}s; results may be incomplete)"
         return result
 
     # ── Copy / Move / Delete File ──
@@ -504,7 +563,8 @@ def register_system_tools(
             "required": ["source", "destination"],
         },
     )
-    async def copy_file(source: str, destination: str) -> str:
+    @_offloaded
+    def copy_file(source: str, destination: str) -> str:
         src = Path(source).expanduser().resolve()
         dst = Path(destination).expanduser().resolve()
         try:
@@ -529,7 +589,8 @@ def register_system_tools(
             "required": ["source", "destination"],
         },
     )
-    async def move_file(source: str, destination: str) -> str:
+    @_offloaded
+    def move_file(source: str, destination: str) -> str:
         src = Path(source).expanduser().resolve()
         dst = Path(destination).expanduser().resolve()
         try:
@@ -551,7 +612,8 @@ def register_system_tools(
         },
         requires_confirmation=True,
     )
-    async def delete_file(path: str) -> str:
+    @_offloaded
+    def delete_file(path: str) -> str:
         p = Path(path).expanduser().resolve()
         try:
             if p.is_dir():
@@ -576,7 +638,8 @@ def register_system_tools(
             "required": ["path"],
         },
     )
-    async def create_directory(path: str) -> str:
+    @_offloaded
+    def create_directory(path: str) -> str:
         p = Path(path).expanduser().resolve()
         try:
             p.mkdir(parents=True, exist_ok=True)
@@ -599,8 +662,15 @@ def register_system_tools(
             },
         },
     )
-    async def get_running_processes(filter_name: str = "") -> str:
+    @_offloaded
+    def get_running_processes(filter_name: str = "") -> str:
         try:
+            # cpu_percent is measured since the previous call per process, so
+            # prime it and sample over a short window; a first call reads 0.0.
+            for proc in psutil.process_iter():
+                with contextlib.suppress(psutil.Error):
+                    proc.cpu_percent(None)
+            time.sleep(0.3)
             procs = []
             for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
                 try:
@@ -636,7 +706,8 @@ def register_system_tools(
         },
         requires_confirmation=True,
     )
-    async def kill_process(target: str) -> str:
+    @_offloaded
+    def kill_process(target: str) -> str:
         try:
             # Try as PID first
             try:
@@ -683,13 +754,12 @@ def register_system_tools(
             return "Volume control only supported on Windows"
         try:
             if level == -1:
-                # Toggle mute via nircmd or PowerShell
-                result = await asyncio.create_subprocess_shell(
+                code, _, stderr = await _run_shell(
                     'powershell -c "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    timeout=10,
                 )
-                await result.communicate()
+                if code != 0:
+                    return f"Could not toggle mute: {stderr.decode(errors='replace').strip()}"
                 return "Toggled mute"
             else:
                 level = max(0, min(100, level))
@@ -702,12 +772,9 @@ def register_system_tools(
                 $steps = [math]::Round({level} / 2);
                 for($i=0; $i -lt $steps; $i++) {{ $obj.SendKeys([char]175) }};
                 """
-                result = await asyncio.create_subprocess_shell(
-                    f'powershell -c "{ps_cmd}"',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(result.communicate(), timeout=10)
+                code, _, stderr = await _run_shell(f'powershell -c "{ps_cmd}"', timeout=10)
+                if code != 0:
+                    return f"Could not set volume: {stderr.decode(errors='replace').strip()}"
                 return f"Volume set to ~{level}%"
         except Exception as e:
             return f"Error setting volume: {e}"
@@ -727,7 +794,8 @@ def register_system_tools(
             },
         },
     )
-    async def take_screenshot(save_path: str = "") -> str:
+    @_offloaded
+    def take_screenshot(save_path: str = "") -> str:
         try:
             import pyautogui
             if not save_path:
@@ -749,7 +817,8 @@ def register_system_tools(
         description="Read the current clipboard contents.",
         parameters={"type": "object", "properties": {}},
     )
-    async def clipboard_read() -> str:
+    @_offloaded
+    def clipboard_read() -> str:
         try:
             import pyperclip
             content = pyperclip.paste()
@@ -770,7 +839,8 @@ def register_system_tools(
             "required": ["text"],
         },
     )
-    async def clipboard_write(text: str) -> str:
+    @_offloaded
+    def clipboard_write(text: str) -> str:
         try:
             import pyperclip
             pyperclip.copy(text)
@@ -855,8 +925,8 @@ def register_system_tools(
             "required": ["task_name", "command"],
         },
     )
-    async def scheduler_create(task_name: str, command: str, delay_seconds: int = 60) -> str:
-        import subprocess
+    @_offloaded
+    def scheduler_create(task_name: str, command: str, delay_seconds: int = 60) -> str:
         try:
             # schtasks /st expects a clock time (HH:MM) and /sd a date —
             # compute them from the requested delay.
@@ -866,7 +936,7 @@ def register_system_tools(
             result = subprocess.run(
                 ["schtasks", "/create", "/tn", f"Jarvis_{task_name}", "/tr", command,
                  "/sc", "once", "/st", start_time, "/sd", start_date, "/f"],
-                shell=False, capture_output=True, text=True,
+                shell=False, capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
                 return f"Scheduled '{task_name}' to run at {start_time} on {start_date}"
@@ -879,12 +949,12 @@ def register_system_tools(
         description="List scheduled Jarvis tasks.",
         parameters={"type": "object", "properties": {}},
     )
-    async def scheduler_list() -> str:
-        import subprocess
+    @_offloaded
+    def scheduler_list() -> str:
         try:
             result = subprocess.run(
                 'schtasks /query /fo csv /v | findstr "Jarvis_"',
-                shell=True, capture_output=True, text=True
+                shell=True, capture_output=True, text=True, timeout=30,
             )
             return result.stdout or "No Jarvis tasks scheduled."
         except Exception as e:
@@ -901,12 +971,12 @@ def register_system_tools(
             "required": ["task_name"],
         },
     )
-    async def scheduler_delete(task_name: str) -> str:
-        import subprocess
+    @_offloaded
+    def scheduler_delete(task_name: str) -> str:
         try:
             result = subprocess.run(
                 ["schtasks", "/delete", "/tn", f"Jarvis_{task_name}", "/f"],
-                shell=False, capture_output=True, text=True,
+                shell=False, capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0:
                 return f"Deleted task: {task_name}"
@@ -991,22 +1061,16 @@ def register_system_tools(
 
     @registry.tool(
         name="get_uptime",
-        description="Get system uptime and load averages.",
+        description="Get how long the system has been running since boot.",
         parameters={"type": "object", "properties": {}},
     )
     async def get_uptime() -> str:
-        import platform
-        import subprocess
         try:
-            if platform.system() == "Windows":
-                result = subprocess.run(
-                    "systeminfo | findstr /C:\"System Boot Time\"",
-                    shell=True, capture_output=True, text=True
-                )
-                return result.stdout.strip() or "Uptime info unavailable"
-            else:
-                import uptime
-                return f"Uptime: {uptime.format_timespan(uptime.uptime())}"
+            booted = datetime.fromtimestamp(psutil.boot_time())
+            days, rest = divmod(int((datetime.now() - booted).total_seconds()), 86400)
+            hours, rest = divmod(rest, 3600)
+            return (f"Uptime: {days}d {hours}h {rest // 60}m "
+                    f"(booted {booted:%Y-%m-%d %H:%M})")
         except Exception as e:
             return f"Error: {e}"
 

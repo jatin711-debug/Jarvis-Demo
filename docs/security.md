@@ -42,8 +42,12 @@ Limitations are important:
   "Profiles" below. It is intentionally broad and should be narrowed before
   unattended or multi-user use.
 - The shell command tool remains powerful. Its whitelist rejects shell
-  compositions and command interpreters, but it is not a process sandbox.
-  Catastrophic patterns are blocked even when the whitelist is disabled.
+  compositions, command interpreters, and executables given by path (so a
+  planted `git.exe` cannot borrow the name `git`), but it is not a process
+  sandbox. Catastrophic patterns are blocked even when the whitelist is
+  disabled. The handler and the permission gateway apply the same policy
+  (`validate_command`), so neither can be looser than the other. A command that
+  times out or is cancelled is killed together with its child processes.
 - Global typing, keystrokes, screen-coordinate clicks and title-substring
   window actions were removed because they act without an exact target. Desktop
   control goes through Cua's observed pid/window/snapshot tools; with
