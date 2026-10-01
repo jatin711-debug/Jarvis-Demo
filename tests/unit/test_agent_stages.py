@@ -92,6 +92,57 @@ class TestVision:
         await agent.run("What time is it?")
         agent._capture_screenshot.assert_not_called()
 
+    async def test_a_failed_screenshot_is_disclosed_to_the_model(self):
+        llm = ScriptedLLM([{"content": "I could not capture the screen."}])
+        agent = ReActAgent(llm, make_tools(), "sys")
+        agent._capture_screenshot = AsyncMock(return_value=None)
+        await agent.run("take a screenshot and tell me what you see")
+        sent = llm.requests[0]
+        assert sent["images"] is None
+        assert "could not be captured" in sent["messages"][-1]["content"]
+        assert "VISION MODE" not in sent["messages"][0]["content"]
+
+    async def test_text_only_provider_never_gets_a_screenshot(self, monkeypatch):
+        llm = ScriptedLLM([{"content": "I cannot see the screen."}])
+        llm.supports_images = False
+        agent = ReActAgent(llm, make_tools(), "sys")
+        grabbed = []
+        monkeypatch.setattr(ReActAgent, "_grab_screenshot", staticmethod(lambda: grabbed.append(1)))
+        await agent.run("take a screenshot and tell me what you see")
+        assert not grabbed
+        assert llm.requests[0]["images"] is None
+
+    async def test_screenshot_is_taken_off_the_event_loop(self, monkeypatch):
+        import asyncio
+        import threading
+        import time
+
+        main_thread = threading.get_ident()
+        seen = {}
+
+        def slow_grab():
+            seen["thread"] = threading.get_ident()
+            time.sleep(0.2)
+            return "b64"
+
+        monkeypatch.setattr(ReActAgent, "_grab_screenshot", staticmethod(slow_grab))
+        agent = ReActAgent(ScriptedLLM([]), make_tools(), "sys")
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        background = asyncio.create_task(ticker())
+        try:
+            assert await agent._capture_screenshot() == ["b64"]
+        finally:
+            background.cancel()
+        assert seen["thread"] != main_thread
+        assert ticks >= 5
+
 
 class TestIterationLimit:
     async def test_endless_tool_calls_stop_with_an_honest_message(self):

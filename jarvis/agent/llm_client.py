@@ -9,6 +9,7 @@ Multi-provider LLM client:
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from contextlib import aclosing
@@ -23,7 +24,6 @@ logger = get_logger(__name__)
 
 # Ollama API endpoints
 _API_CHAT = "/api/chat"
-_API_GENERATE = "/api/generate"
 _API_TAGS = "/api/tags"
 
 
@@ -131,6 +131,11 @@ class LLMClient:
         self._hf_model = None
         self._hf_tokenizer = None
 
+    @property
+    def supports_images(self) -> bool:
+        """Whether this provider can look at attached images (the HF path is text-only)."""
+        return self.provider != "huggingface"
+
     async def health_check(self) -> bool:
         """Check if provider is running/available."""
         if self.provider == "huggingface":
@@ -198,20 +203,41 @@ class LLMClient:
     ) -> dict[str, Any]:
         """Chat via Ollama API."""
         assert self._client is not None, "Call startup() first"
+        payload = self._ollama_payload(messages, tools, temperature, max_tokens, images,
+                                       stream=False)
+        logger.debug("llm request messages=%d images=%d", len(payload["messages"]),
+                     len(images or []))
 
-        # Attach images to the last user message if provided
+        resp = await self._client.post(_API_CHAT, json=payload)
+        resp.raise_for_status()
+        result = resp.json()
+
+        logger.debug("llm response chars=%d", len(result.get("message", {}).get("content", "")))
+        return result
+
+    def _ollama_payload(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        images: list[str] | None,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        """The /api/chat request body shared by streamed and non-streamed calls."""
         msgs = [dict(m) for m in messages]
-        if images and msgs:
-            # Find last user message and attach images
-            for i in range(len(msgs) - 1, -1, -1):
-                if msgs[i].get("role") == "user":
-                    msgs[i]["images"] = images
+        if images:
+            # Images belong to the most recent user message.
+            for message in reversed(msgs):
+                if message.get("role") == "user":
+                    message["images"] = images
                     break
 
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": msgs,
-            "stream": False,
+            "stream": stream,
             "keep_alive": "30m",
             "options": {
                 "temperature": self.config.temperature if temperature is None else temperature,
@@ -220,22 +246,12 @@ class LLMClient:
                 "num_ctx": self.config.context_window,
             },
         }
-
         # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
         if "qwen3.5" in self.config.model.lower():
             payload["think"] = False
-
         if tools:
             payload["tools"] = tools
-
-        logger.debug("llm request messages=%d images=%d", len(msgs), len(images or []))
-
-        resp = await self._client.post(_API_CHAT, json=payload)
-        resp.raise_for_status()
-        result = resp.json()
-
-        logger.debug("llm response chars=%d", len(result.get("message", {}).get("content", "")))
-        return result
+        return payload
 
     async def _chat_huggingface(
         self,
@@ -249,27 +265,6 @@ class LLMClient:
 
         logger.debug("huggingface response chars=%d", len(content))
         return {"message": {"role": "assistant", "content": content}}
-
-    async def chat_stream(
-        self,
-        messages: list[dict[str, str]],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        images: list[str] | None = None,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[str]:
-        """
-        Stream a chat completion, yielding text chunks.
-
-        Note: tool_calls arriving during the stream are silently collected;
-        use chat_stream_events() if you need them.
-        """
-        async for event in self.chat_stream_events(
-            messages, tools=tools, temperature=temperature,
-            max_tokens=max_tokens, images=images,
-        ):
-            if event["type"] == "content":
-                yield event["text"]
 
     async def chat_stream_events(
         self,
@@ -299,14 +294,15 @@ class LLMClient:
 
         full_text = ""
         tool_calls: list[dict[str, Any]] = []
-        async for kind, payload in self._stream_ollama(
+        async with aclosing(self._stream_ollama(
             messages, tools, temperature, max_tokens, images
-        ):
-            if kind == "content":
-                full_text += payload
-                yield {"type": "content", "text": payload}
-            elif kind == "tool_calls":
-                tool_calls.extend(payload)
+        )) as stream:
+            async for kind, payload in stream:
+                if kind == "content":
+                    full_text += payload
+                    yield {"type": "content", "text": payload}
+                elif kind == "tool_calls":
+                    tool_calls.extend(payload)
         yield {"type": "done", "content": full_text, "tool_calls": tool_calls}
 
     async def _stream_ollama(
@@ -317,47 +313,33 @@ class LLMClient:
         max_tokens: int | None = None,
         images: list[str] | None = None,
     ) -> AsyncIterator[tuple[str, Any]]:
-        """Raw Ollama stream: yields ("content", token) or ("tool_calls", [...])."""
+        """Raw Ollama stream: yields ("content", token) or ("tool_calls", [...]).
+
+        Raises when the server rejects the request, reports an error mid-stream,
+        or closes the stream before the final ``done`` message: a truncated
+        reply must not be mistaken for a complete one.
+        """
         assert self._client is not None, "Call startup() first"
-
-        # Attach images to the last user message if provided
-        msgs = [dict(m) for m in messages]
-        if images and msgs:
-            for i in range(len(msgs) - 1, -1, -1):
-                if msgs[i].get("role") == "user":
-                    msgs[i]["images"] = images
-                    break
-
-        payload: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": msgs,
-            "stream": True,
-            "keep_alive": "30m",
-            "options": {
-                "temperature": self.config.temperature if temperature is None else temperature,
-                "top_p": self.config.top_p,
-                "num_predict": max_tokens or self.config.max_tokens,
-                "num_ctx": self.config.context_window,
-            },
-        }
-
-        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
-        if "qwen3.5" in self.config.model.lower():
-            payload["think"] = False
-
-        if tools:
-            payload["tools"] = tools
+        payload = self._ollama_payload(messages, tools, temperature, max_tokens, images,
+                                       stream=True)
 
         async with self._client.stream("POST", _API_CHAT, json=payload) as resp:
+            if resp.status_code >= 400:
+                # A streamed response has no body yet; read it so the caller can
+                # tell "this model does not support tools" from other failures.
+                await resp.aread()
             resp.raise_for_status()
-            import json as _json
+            finished = False
             async for line in resp.aiter_lines():
                 if not line.strip():
                     continue
                 try:
-                    data = _json.loads(line)
-                except Exception:
+                    data = json.loads(line)
+                except ValueError:
+                    logger.debug("ollama stream line skipped (not json) chars=%d", len(line))
                     continue
+                if data.get("error"):
+                    raise RuntimeError(f"Ollama reported an error: {data['error']}")
                 message = data.get("message", {})
                 token = message.get("content", "")
                 if token:
@@ -366,21 +348,10 @@ class LLMClient:
                 if calls:
                     yield ("tool_calls", calls)
                 if data.get("done", False):
+                    finished = True
                     break
-
-    async def _chat_stream_ollama(
-        self,
-        messages: list[dict[str, str]],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        images: list[str] | None = None,
-    ) -> AsyncIterator[str]:
-        """Stream via Ollama API (text tokens only)."""
-        async for kind, payload in self._stream_ollama(
-            messages, None, temperature, max_tokens, images
-        ):
-            if kind == "content":
-                yield payload
+            if not finished:
+                raise httpx.RemoteProtocolError("Ollama closed the stream before the reply finished")
 
     async def _chat_stream_huggingface(
         self,
@@ -446,38 +417,3 @@ class LLMClient:
             finally:
                 stop.set()
                 await asyncio.shield(worker)
-
-    async def generate(self, prompt: str) -> str:
-        """Simple single-shot generation (no chat history)."""
-        if self.provider == "huggingface":
-            loop = asyncio.get_event_loop()
-
-            def _generate():
-                inputs = self._hf_tokenizer(
-                    prompt, return_tensors="pt"
-                ).to(self._hf_model.device)
-                output = self._hf_model.generate(
-                    **inputs,
-                    max_new_tokens=self.config.max_tokens,
-                    do_sample=True,
-                    temperature=self.config.temperature,
-                )
-                return self._hf_tokenizer.decode(
-                    output[0], skip_special_tokens=True
-                )
-
-            return await loop.run_in_executor(None, _generate)
-
-        assert self._client is not None, "Call startup() first"
-
-        resp = await self._client.post(_API_GENERATE, json={
-            "model": self.config.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": self.config.temperature,
-                "num_predict": self.config.max_tokens,
-            },
-        })
-        resp.raise_for_status()
-        return resp.json().get("response", "")
