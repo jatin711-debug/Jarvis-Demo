@@ -44,8 +44,10 @@ class TTSConfig(BaseModel):
 class VoiceConfig(BaseModel):
     wake_word: str = "hey_jarvis"
     sensitivity: float = Field(default=0.5, ge=0, le=1)
-    input_device: int | None = None
-    output_device: int | None = None
+    # An index, a device name (case-insensitive substring, survives index changes),
+    # or None for the system default. See jarvis/voice/devices.py.
+    input_device: int | str | None = None
+    output_device: int | str | None = None
     barge_in: bool = True  # Let the user interrupt TTS playback by speaking
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)

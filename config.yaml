@@ -6,7 +6,7 @@
 #
 #   extends: config.yaml
 #   voice:
-#     input_device: 2
+#     input_device: "JBL"
 #
 # See docs/security.md before widening the `security` section.
 
@@ -27,8 +27,11 @@ system:
 voice:
   wake_word: "hey_jarvis"     # OpenWakeWord model name
   sensitivity: 0.4
-  input_device: null           # null = system default; set an index in config.local.yaml
-  output_device: null          # null = system default
+  # null = system default. Prefer a name over an index in config.local.yaml: a name such as
+  # "JBL" (case-insensitive substring) keeps meaning the same device when indexes shift,
+  # and falls back to the default if that device is not connected. `jarvis --doctor` lists them.
+  input_device: null
+  output_device: null
   barge_in: true               # let the user interrupt Jarvis mid-response by speaking
 
   stt:

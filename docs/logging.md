@@ -48,6 +48,18 @@ Select-String -Path ~\.jarvis\logs\jarvis.log -Pattern '\| t7 \|'
 Anything at WARN or ERROR is worth reading: a deadline was hit, a service failed to
 start, or a tool was refused.
 
+The voice loop contains device and engine crashes instead of exiting:
+
+| Event | Meaning |
+|-------|---------|
+| `session failed error=...; retrying in Ns` / `voice loop failed ...` (ERROR) | A conversation session or the wake word stream crashed; Jarvis waits (1s, doubling to 10s, reset by a session that ends cleanly) and goes back to listening. The traceback is in the log file at DEBUG |
+| `mic open failed` / `mic read failed` (WARN), `mic recovered` (INFO) | The microphone dropped (headset unplugged, driver reset) and is being reopened |
+| `speech output failed` / `barge-in monitor failed` (WARN) | The speaker could not play a sentence, or the barge-in monitor could not open the mic so that sentence cannot be interrupted |
+| `transcription failed` (ERROR) | Speech recognition raised; the attempt counts as silence |
+
+Repeated device failures are rate-limited: the first one is a WARN with the error,
+identical repeats drop to DEBUG (`... failed again`) until the component works again.
+
 ## Writing log messages
 
 * A short lower-case event word first, then `key=value` fields: `tool ok name=x ms=12`.

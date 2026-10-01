@@ -54,6 +54,9 @@ wider permissions) in an untracked `config.local.yaml` that starts with
 `extends: config.yaml`; it is picked up automatically. Pick another file with
 `--config PATH` or `JARVIS_CONFIG`. See [security profiles](docs/security.md#profiles).
 Notable options: `voice.barge_in`, `system.latency_report`, `voice.tts.engine` (`kokoro` or `piper`).
+`voice.input_device` / `voice.output_device` take an index or a device name such as `"JBL"`;
+a name keeps working when a headset reconnects and indexes shift, and falls back to the system
+default (with a warning) when that device is not connected. `jarvis --doctor` lists the devices.
 
 ### Logs
 Console output is one readable line per event, tagged with the turn number

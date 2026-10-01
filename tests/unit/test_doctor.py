@@ -79,26 +79,39 @@ class TestAudio:
         checks = by_name(doctor.check_audio(config(), FakeSounddevice([MIC, SPEAKER])))
         assert checks["microphone"].status == OK and checks["speaker"].status == OK
 
-    def test_configured_device_that_is_not_a_microphone_lists_the_real_ones(self):
+    def test_an_index_that_is_not_a_microphone_warns_and_lists_the_real_ones(self):
         checks = by_name(doctor.check_audio(
             config(voice={"input_device": 1}), FakeSounddevice([MIC, SPEAKER])))
-        assert checks["microphone"].status == FAIL
+        assert checks["microphone"].status == WARN
         assert "0=Headset Mic" in checks["microphone"].detail
-        assert "config.local.yaml" in checks["microphone"].hint
+        assert "name instead of an index" in checks["microphone"].hint
 
-    def test_configured_device_that_exists(self):
+    def test_configured_index_that_exists(self):
         checks = by_name(doctor.check_audio(
             config(voice={"input_device": 0}), FakeSounddevice([MIC, SPEAKER])))
         assert checks["microphone"].status == OK and "Headset Mic" in checks["microphone"].detail
+
+    def test_configured_name_is_resolved(self):
+        checks = by_name(doctor.check_audio(
+            config(voice={"input_device": "headset", "output_device": "HEADSET OUT"}),
+            FakeSounddevice([SPEAKER, MIC])))
+        assert checks["microphone"].status == OK and "= 1: Headset Mic" in checks["microphone"].detail
+        assert checks["speaker"].status == OK and "= 0: Headset Out" in checks["speaker"].detail
+
+    def test_a_named_headset_that_is_not_connected_warns(self):
+        checks = by_name(doctor.check_audio(
+            config(voice={"input_device": "JBL"}), FakeSounddevice([MIC, SPEAKER])))
+        assert checks["microphone"].status == WARN
+        assert "system default will be used" in checks["microphone"].detail
 
     def test_no_devices_at_all(self):
         checks = by_name(doctor.check_audio(config(), FakeSounddevice([])))
         assert checks["microphone"].status == FAIL and checks["speaker"].status == FAIL
 
-    def test_bad_output_device_index(self):
+    def test_bad_output_device_index_warns(self):
         checks = by_name(doctor.check_audio(
             config(voice={"output_device": 0}), FakeSounddevice([MIC, SPEAKER])))
-        assert checks["speaker"].status == FAIL
+        assert checks["speaker"].status == WARN
 
     def test_device_listing_error_is_reported(self):
         class Broken:

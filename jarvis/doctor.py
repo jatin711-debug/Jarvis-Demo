@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from jarvis.utils.config import JarvisConfig, expand_path
+from jarvis.voice.devices import default_hostapi, describe, resolve_device
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 
@@ -73,8 +74,8 @@ def check_packages(config: JarvisConfig, find: FindSpec = importlib.util.find_sp
     wanted: list[tuple[str, str, str, str]] = [
         ("speech-to-text", "faster_whisper", FAIL, "pip install faster-whisper"),
         ("wake word", "openwakeword", FAIL, "pip install openwakeword"),
-        ("microphone", "pyaudio", FAIL, "pip install pyaudio"),
-        ("audio output", "sounddevice", FAIL, "pip install sounddevice"),
+        ("mic capture", "pyaudio", FAIL, "pip install pyaudio"),
+        ("audio playback", "sounddevice", FAIL, "pip install sounddevice"),
         ("text-to-speech", "piper" if config.voice.tts.engine == "piper" else "kokoro", FAIL,
          "pip install piper-tts" if config.voice.tts.engine == "piper" else "pip install kokoro"),
     ]
@@ -162,33 +163,31 @@ def check_audio(config: JarvisConfig, sd: Any = None) -> list[Check]:
     except Exception as exc:
         return [Check("audio devices", FAIL, f"cannot list devices ({exc})")]
 
-    inputs = [(i, d["name"]) for i, d in enumerate(devices) if d.get("max_input_channels", 0) > 0]
-    outputs = [(i, d["name"]) for i, d in enumerate(devices) if d.get("max_output_channels", 0) > 0]
-    listing = ", ".join(f"{i}={name}" for i, name in inputs[:6]) or "none"
+    hostapi = default_hostapi(sd, devices)
+
     checks = []
-
-    wanted = config.voice.input_device
-    if wanted is None:
-        if inputs:
-            checks.append(Check("microphone", OK, f"system default ({len(inputs)} inputs)"))
+    inputs = describe(devices, "input", limit=8, hostapi=hostapi)
+    outputs = describe(devices, "output", limit=8, hostapi=hostapi)
+    if inputs != "none" or outputs != "none":
+        checks.append(Check("audio devices", OK, f"inputs: {inputs}; outputs: {outputs}"))
+    for name, kind, spec in (("microphone", "input", config.voice.input_device),
+                             ("speaker", "output", config.voice.output_device)):
+        key = f"voice.{kind}_device"
+        available = describe(devices, kind)
+        if available == "none":
+            checks.append(Check(name, FAIL, f"no {kind} device found",
+                                "connect one, then run --doctor again"))
+            continue
+        index = resolve_device(spec, kind, devices, hostapi)
+        if spec is None:
+            checks.append(Check(name, OK, "system default"))
+        elif index is None:
+            checks.append(Check(name, WARN,
+                                f"{key} {spec!r} not found; the system default will be used "
+                                f"(available: {available})",
+                                "use a device name instead of an index: it survives reconnects"))
         else:
-            checks.append(Check("microphone", FAIL, "no input device found",
-                                "connect a microphone, then run --doctor again"))
-    elif any(i == wanted for i, _ in inputs):
-        name = next(n for i, n in inputs if i == wanted)
-        checks.append(Check("microphone", OK, f"voice.input_device {wanted} = {name}"))
-    else:
-        checks.append(Check("microphone", FAIL,
-                            f"voice.input_device {wanted} is not an input device (inputs: {listing})",
-                            "device indexes change when headsets reconnect; fix it in config.local.yaml"))
-
-    out_wanted = config.voice.output_device
-    if out_wanted is not None and not any(i == out_wanted for i, _ in outputs):
-        checks.append(Check("speaker", FAIL, f"voice.output_device {out_wanted} is not an output device"))
-    elif outputs:
-        checks.append(Check("speaker", OK, "output device available"))
-    else:
-        checks.append(Check("speaker", FAIL, "no output device found"))
+            checks.append(Check(name, OK, f"{key} {spec!r} = {index}: {devices[index]['name']}"))
     return checks
 
 

@@ -27,6 +27,7 @@ from jarvis.tools.system_tools import register_system_tools
 from jarvis.utils.config import expand_path
 from jarvis.utils.logger import begin_turn, end_turn, get_logger
 from jarvis.voice.cues import play_listening_cue, play_wake_cue
+from jarvis.voice.devices import resolve_voice_devices
 from jarvis.voice.transcript import is_explicit_yes, is_garbage, is_hallucination
 
 if TYPE_CHECKING:
@@ -36,10 +37,20 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_SENTENCE_END = re.compile(r"[.!?]\s+|[.!?]$|\n")
+# A sentence ends at a terminator followed by whitespace, or at a newline. A terminator
+# at the very end of the buffer is not enough: streamed tokens can split "3.5" into
+# "3" and ".5", so the last sentence is flushed when the stream ends instead.
+_SENTENCE_END = re.compile(r"[.!?]\s+|\n")
 
 # After this many empty recordings in a row the session drops back to wake word.
 _MAX_SILENT_FOLLOWUPS = 2
+
+# A failed conversation session (or voice loop) is retried after this long, doubling
+# up to the cap; a session that finishes cleanly resets the delay.
+_RETRY_MIN_SECONDS = 1.0
+_RETRY_MAX_SECONDS = 10.0
+
+_sleep = asyncio.sleep  # indirected so tests can skip the waits
 
 # Said alone, these end the whole application.
 _EXIT_PHRASES = frozenset({
@@ -80,6 +91,12 @@ def _clip(text: str, limit: int = _REPLY_LOG_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _describe(error: BaseException) -> str:
+    """One-line ``Type: message`` text for a log field."""
+    text = " ".join(str(error).split())
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 class Orchestrator:
     """
     The brain of JARVIS: boots services and coordinates the voice loop.
@@ -94,6 +111,8 @@ class Orchestrator:
 
     def __init__(self, config: JarvisConfig) -> None:
         self.config = config
+        # Voice settings with device names turned into indexes (see _init_voice).
+        self._voice = config.voice
         self._running = False
 
         # Core services
@@ -113,6 +132,10 @@ class Orchestrator:
 
         # Conversation state
         self._conversation_history: list[dict[str, str]] = []
+
+        # Voice loop supervision
+        self._retry_delay = _RETRY_MIN_SECONDS
+        self._faults: dict[str, str] = {}  # last error per audio component, to log repeats quietly
 
     # ── Startup ─────────────────────────────────────────────
 
@@ -177,20 +200,43 @@ class Orchestrator:
         )
 
         if self.tts:
-            await self.tts.speak("Jarvis online. How can I help?")
+            try:
+                await self.tts.speak("Jarvis online. How can I help?")
+            except Exception as e:
+                raise RuntimeError(
+                    f"speech output failed during startup ({_describe(e)}); check the speakers "
+                    "and voice.output_device in config.yaml, or run with --text"
+                ) from e
 
     async def _init_voice(self, cfg: JarvisConfig) -> None:
-        """Initialize TTS, STT, and wake word engines."""
+        """Initialize TTS, STT, and wake word engines; any failure is a startup RuntimeError."""
         from jarvis.voice.implementations import KokoroTTS, OpenWakeWordEngine, PiperTTS, WhisperSTT
 
-        self.tts = PiperTTS(cfg.voice) if cfg.voice.tts.engine.lower() == "piper" else KokoroTTS(cfg.voice)
-        await self.tts.startup()
+        # Device names ("JBL") become indexes now, against the devices present at this moment.
+        self._voice = await asyncio.to_thread(resolve_voice_devices, cfg.voice)
+        voice = self._voice
 
-        self.stt = WhisperSTT(cfg.voice)
-        await self.stt.startup()
+        self.tts = PiperTTS(voice) if voice.tts.engine.lower() == "piper" else KokoroTTS(voice)
+        self.stt = WhisperSTT(voice)
+        self.wake_word = OpenWakeWordEngine(voice)
 
-        self.wake_word = OpenWakeWordEngine(cfg.voice)
-        await self.wake_word.startup()
+        stages = (
+            ("text-to-speech", "check voice.tts in config.yaml and that the engine is installed",
+             self.tts),
+            ("speech recognition", "check voice.stt in config.yaml and your network connection "
+             "for the first model download", self.stt),
+            ("wake word", "check the microphone, voice.input_device and voice.wake_word in "
+             "config.yaml", self.wake_word),
+        )
+        for label, hint, engine in stages:
+            try:
+                await engine.startup()
+            except RuntimeError:
+                raise  # already a one-line, actionable startup error
+            except Exception as e:
+                raise RuntimeError(
+                    f"{label} failed to start ({_describe(e)}); {hint}, or run with --text"
+                ) from e
 
     def _require_agent(self) -> ReActAgent:
         if self.agent is None or self.memory is None:
@@ -266,7 +312,7 @@ class Orchestrator:
 
             leftover = pending.strip()
             if leftover and not interrupted:
-                await speak(leftover)
+                interrupted = await speak(leftover)
         finally:
             self.wake_word.unsuppress(cooldown=0.5)
 
@@ -298,11 +344,47 @@ class Orchestrator:
 
     # ── Speech output ───────────────────────────────────────
 
-    async def _speak_safe(self, text: str) -> None:
-        """Speak with wake word suppression to prevent echo triggers."""
-        self.wake_word.suppress()
+    def _note_fault(self, component: str, error: Exception) -> None:
+        """Log an audio failure: WARNING the first time, DEBUG while the same error repeats."""
+        text = _describe(error)
+        if self._faults.get(component) == text:
+            logger.debug("%s failed again error=%s", component, text)
+        else:
+            self._faults[component] = text
+            logger.warning("%s failed error=%s (identical repeats are logged at debug "
+                           "until it works again)", component, text)
+
+    def _note_outcome(self, component: str, result: object) -> None:
+        """Record how an audio task ended: an exception is a fault, a normal end clears it."""
+        if isinstance(result, Exception):
+            self._note_fault(component, result)
+        elif not isinstance(result, BaseException):  # not a cancellation
+            self._faults.pop(component, None)
+
+    async def _speak_plain(self, text: str) -> None:
+        """tts.speak, but a cancelled turn stops playback instead of finishing the sentence."""
         try:
             await self.tts.speak(text)
+        except asyncio.CancelledError:
+            self.tts.abort()
+            raise
+
+    async def _speak_safe(self, text: str) -> bool:
+        """
+        Speak with wake word suppression to prevent echo triggers.
+        Never raises: a dead speaker must not take the voice loop down with it.
+        Returns False if the text could not be spoken.
+        """
+        self.wake_word.suppress()
+        try:
+            await self._speak_plain(text)
+        except Exception as e:
+            self._note_fault("speech output", e)
+            logger.debug("speech failure detail", exc_info=True)
+            return False
+        else:
+            self._faults.pop("speech output", None)
+            return True
         finally:
             # Resume detection with a cooldown so residual mic audio is ignored.
             self.wake_word.unsuppress(cooldown=1.0)
@@ -311,9 +393,12 @@ class Orchestrator:
         """
         Speak a sentence, allowing the user to barge in by talking over it.
         Returns True if playback was interrupted by user speech.
+
+        A failing speaker or microphone does not fail the turn: it is logged
+        (see _note_fault) and the reply carries on without that part.
         """
         if not self.config.voice.barge_in:
-            await self.tts.speak(text)
+            await self._speak_plain(text)
             return False
 
         from jarvis.voice.implementations import wait_for_speech
@@ -321,7 +406,7 @@ class Orchestrator:
         cancel = asyncio.Event()
         speak_task = asyncio.create_task(self.tts.speak(text))
         monitor_task = asyncio.create_task(
-            wait_for_speech(self.config.voice.input_device, cancel_event=cancel)
+            wait_for_speech(self._voice.input_device, cancel_event=cancel)
         )
 
         interrupted = False
@@ -329,18 +414,19 @@ class Orchestrator:
             done, _ = await asyncio.wait({speak_task, monitor_task},
                                          return_when=asyncio.FIRST_COMPLETED)
             if monitor_task in done and not speak_task.done():
-                try:
+                if not monitor_task.cancelled() and monitor_task.exception() is None:
                     interrupted = monitor_task.result()
-                except Exception as e:
-                    logger.debug("barge-in monitor failed error=%s", e)
                 if interrupted:
                     self.tts.abort()
+        except asyncio.CancelledError:
+            self.tts.abort()  # shutting down: do not wait out the rest of the sentence
+            raise
         finally:
             cancel.set()
-            results = await asyncio.gather(speak_task, monitor_task, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.debug("speak/monitor task error=%s", result)
+            speech, monitor = await asyncio.gather(speak_task, monitor_task,
+                                                   return_exceptions=True)
+            self._note_outcome("speech output", speech)
+            self._note_outcome("barge-in monitor", monitor)
 
         if interrupted:
             logger.info("barge-in playback interrupted")
@@ -370,7 +456,7 @@ class Orchestrator:
                 silence_duration=1.2,
                 max_duration=6.0,
                 min_speech_duration=0.3,
-                input_device=self.config.voice.input_device,
+                input_device=self._voice.input_device,
             )
             heard = (await self.stt.transcribe(audio)).strip().lower()
         except Exception as e:
@@ -402,7 +488,7 @@ class Orchestrator:
         try:
             audio_bytes = await record_until_silence(
                 sample_rate=16000,
-                input_device=self.config.voice.input_device,
+                input_device=self._voice.input_device,
             )
         except Exception as e:
             logger.error("recording failed error=%s", e)
@@ -410,7 +496,12 @@ class Orchestrator:
         record_s = time.monotonic() - t_record
 
         t_stt = time.monotonic()
-        text = (await self.stt.transcribe(audio_bytes)).strip()
+        try:
+            text = (await self.stt.transcribe(audio_bytes)).strip()
+        except Exception as e:
+            logger.error("transcription failed error=%s", _describe(e))
+            logger.debug("transcription failure detail", exc_info=True)
+            return None
         stt_s = time.monotonic() - t_stt
 
         if not text:
@@ -439,7 +530,7 @@ class Orchestrator:
                 if silent >= _MAX_SILENT_FOLLOWUPS:
                     logger.info("session ended reason=silence")
                     return
-                await play_listening_cue()
+                await play_listening_cue(self._voice.output_device)
                 continue
 
             silent = 0
@@ -474,32 +565,78 @@ class Orchestrator:
             await self._speak_safe(response)
 
         logger.info("reply text=%r", _clip(response))
-        await play_listening_cue()
+        await play_listening_cue(self._voice.output_device)
         return False
 
-    async def run(self) -> None:
-        """Main voice loop: wake word -> conversation session -> repeat."""
-        if self.wake_word is None or self.stt is None or self.tts is None:
-            raise RuntimeError("Voice stack is not initialized; start with voice_enabled=True")
+    async def _back_off(self, what: str, error: Exception) -> None:
+        """Log a contained failure (one line; traceback at DEBUG) and wait before retrying."""
+        delay = self._retry_delay
+        self._retry_delay = min(delay * 2, _RETRY_MAX_SECONDS)
+        logger.error("%s failed error=%s; retrying in %.0fs", what, _describe(error), delay)
+        logger.debug("%s failure detail", what, exc_info=error)
+        if self._running:
+            await _sleep(delay)
 
+    async def _run_session(self) -> None:
+        """
+        One wake-word-initiated conversation. An unexpected failure (mic unplugged,
+        speech engine crash, ...) ends only this session: it is logged and the
+        voice loop backs off briefly, then goes back to waiting for the wake word.
+        """
+        failure: Exception | None = None
+        self.wake_word.suppress()
+        try:
+            await play_wake_cue(self._voice.output_device)
+            await self._conversation_session()
+        except Exception as e:
+            failure = e
+        finally:
+            if self._running:
+                self.wake_word.unsuppress(cooldown=1.0)
+
+        if failure is None:
+            self._retry_delay = _RETRY_MIN_SECONDS
+        else:
+            await self._back_off("session", failure)
+
+    async def _listen_for_wake_word(self) -> None:
         wake_word = self.config.voice.wake_word
         logger.info("waiting for wake word=%r", wake_word)
 
-        async for detected in self.wake_word.listen():
-            if not self._running:
-                break
-            if not detected:
-                continue
+        # aclosing: leaving the loop (exit phrase, cancellation) releases the mic at once.
+        async with aclosing(self.wake_word.listen()) as detections:
+            async for detected in detections:
+                if not self._running:
+                    break
+                if not detected:
+                    continue
 
-            logger.info("wake word detected")
-            self.wake_word.suppress()
-            await play_wake_cue()
+                logger.info("wake word detected")
+                await self._run_session()
 
-            await self._conversation_session()
+                if self._running:
+                    logger.info("waiting for wake word=%r", wake_word)
 
-            if self._running:
-                self.wake_word.unsuppress(cooldown=1.0)
-                logger.info("waiting for wake word=%r", wake_word)
+    async def run(self) -> None:
+        """
+        Main voice loop: wake word -> conversation session -> repeat.
+
+        Failures are contained so one bad device or engine call cannot end the
+        process: a failed session is logged and retried after a growing delay
+        (1s doubling to 10s, reset by a session that ends cleanly), and a wake word
+        stream that dies is restarted the same way. Only cancellation and
+        KeyboardInterrupt leave this loop abnormally.
+        """
+        if self.wake_word is None or self.stt is None or self.tts is None:
+            raise RuntimeError("Voice stack is not initialized; start with voice_enabled=True")
+
+        self._retry_delay = _RETRY_MIN_SECONDS
+        while self._running:
+            try:
+                await self._listen_for_wake_word()
+                return  # the detector ended on its own; nothing left to supervise
+            except Exception as e:
+                await self._back_off("voice loop", e)
 
     # ── Shutdown ────────────────────────────────────────────
 
