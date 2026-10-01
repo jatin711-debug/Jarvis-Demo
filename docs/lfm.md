@@ -1,55 +1,57 @@
-# Optional LFM2.5-350M profile
+# LFM profile (local HuggingFace model)
 
-From the repository root:
+`config.lfm.yaml` is `config.yaml` with the local `LiquidAI/LFM2.5-350M` model
+instead of Ollama/Qwen (`extends: config.yaml`, so security, voice and desktop
+settings are inherited). Memory is off in this profile: Mem0 needs an Ollama
+extraction model. It does not need Ollama for chat. The model is text-only; the
+agent uses Cua accessibility observations, not screenshots.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[lfm,desktop]"
-.\.venv\Scripts\python.exe -m jarvis --config config.lfm.yaml
-```
+## Which Python
 
-For the CUDA-enabled global Python 3.12 on this machine, use:
-
-```powershell
-& 'C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe' -m jarvis --config config.lfm.yaml
-```
-
-That interpreter must also have the voice and desktop dependencies installed.
-They are not inherited from `.venv`. Install the project extras with that exact
-interpreter (`-m pip install -e ".[lfm,desktop]"`) before full voice startup.
-The voice-free model test can run without installing Jarvis as a package:
+Use an interpreter whose PyTorch has CUDA and whose Transformers is 5.16.1 or
+later in the 5.x series (the checkpoint's tokenizer needs it). On this machine
+that is the global Python 3.12, not `.venv` (CPU-only torch, older Transformers):
 
 ```powershell
-python -c "import runpy; runpy.run_path('tests/manual/lfm_smoke.py', run_name='__main__')"
+$py = 'C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe'
+& $py -m pip install -e ".[lfm,desktop]"   # only if packages are missing
+& $py -m jarvis --doctor                   # checks devices and packages
 ```
 
-The current checkpoint's tokenizer requires newer Transformers; the LFM extra
-requires 5.16.1 or later in the 5.x series. No remote tokenizer code is enabled.
+## Making it your default
 
-The first startup downloads `LiquidAI/LFM2.5-350M` from Hugging Face to its normal
-model cache. Later inference is local. This is a separate profile, not an overlay
-on config.yaml: unspecified settings use application defaults. Your Qwen profile
-is unchanged. Stop the existing Jarvis process before starting this profile.
+Per-machine, in the untracked `config.local.yaml`: `extends: config.lfm.yaml`.
+Then plain `python -m jarvis` uses LFM. To go back to Qwen, change it to
+`extends: config.yaml` and start Ollama. The committed `config.yaml` stays on Qwen.
 
-This profile disables memory (Mem0 currently assumes an Ollama extraction model),
-uses microphone device 2 (JBL), distil-small.en recognition, and Kokoro am_michael
-to match the original voice profile. It enables Cua and dangerous-operation voice
-confirmations. It does not need Ollama for chat. It is text-only: use Cua's
-accessibility observations, not screenshot interpretation.
-
-The Hugging Face backend uses real decoded-text streaming and preserves Liquid
-tool-call markers for the existing parser. Cancellation requests generation stop
-at the next model step and waits for the worker before releasing the model lock.
-A native inference step cannot be forcibly interrupted; this isn't a hard
-process-level deadline. Model loading itself is outside the response deadline.
-
-Run the opt-in, voice-free test with:
+## Run it
 
 ```powershell
-.\.venv\Scripts\python.exe tests\manual\lfm_smoke.py
+# 1. Model only, no voice hardware: a greeting and one harmless tool call.
+& $py tests\manual\lfm_smoke.py
+
+# 2. The whole agent on text: routing, tools, permissions. No mic or speakers.
+& $py -m jarvis --text "What time is it?"
+
+# 3. The full voice pipeline: wake word -> record -> STT -> LFM -> TTS.
+& $py -m jarvis -v
 ```
 
-It tests a greeting and a harmless deterministic tool, not desktop reliability.
-The model runs on the devices supported by your installed PyTorch build; a CPU
-build cannot use CUDA. CPU Transformers speed is not comparable to advertised
-optimized GGUF runtime throughput. Keep Qwen as the default until task accuracy
-and latency meet your needs. No automatic model fallback/routing is introduced.
+The first run downloads the checkpoint to the Hugging Face cache; later runs are
+local. Read the console as one line per event; the full DEBUG record is in
+`~/.jarvis/logs/jarvis.log` ([logging](logging.md)). The `latency` line splits
+record, STT, first token and TTS time.
+
+## Behavior to know
+
+- The backend streams decoded text and keeps Liquid's tool-call markers for the
+  existing parser. Cancelling a turn stops generation at the next model step; a
+  native inference step cannot be forcibly interrupted. Model loading is outside
+  the response deadline.
+- The model runs on whatever your PyTorch build supports; a CPU build cannot use
+  CUDA, and CPU Transformers speed is not comparable to GGUF runtimes.
+- The 350M model is for deterministic, structured tasks; its card does not
+  recommend it for knowledge-heavy work. Larger LFM2.5 checkpoints exist, but a
+  2.6B model in 16-bit is about 5 GB and does not fit this machine's 4 GB GPU.
+  Compare models on the same scenarios before changing the default.
+- No automatic model fallback or routing is introduced.
