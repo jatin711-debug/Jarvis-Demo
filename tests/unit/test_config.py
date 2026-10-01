@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.utils.config import JarvisConfig, expand_path, load_config
+from jarvis.utils.config import JarvisConfig, SecurityConfig, expand_path, load_config
 
 
 class TestDefaults:
@@ -122,6 +122,10 @@ class TestShippedProfiles:
         assert cfg.security.allowed_directories == ["~"]
         assert cfg.security.blocked_commands  # non-empty blocklist
         assert cfg.system.log_level == "INFO"
+
+    def test_code_defaults_match_the_shipped_security_profile(self):
+        """A config that omits a security key must not be wider than config.yaml."""
+        assert SecurityConfig() == load_config(self.ROOT / "config.yaml").security
 
     def test_lfm_profile_loads(self):
         assert load_config(self.ROOT / "config.lfm.yaml").llm.provider == "huggingface"

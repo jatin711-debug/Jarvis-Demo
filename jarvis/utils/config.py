@@ -101,19 +101,19 @@ class DesktopConfig(BaseModel):
 
 
 class SecurityConfig(BaseModel):
+    """Defaults are the standard profile in config.yaml (a test keeps them identical),
+    so a config that omits a key never ends up wider than the shipped one."""
+
     confirm_dangerous_ops: bool = True
     command_whitelist: bool = True
     allowed_commands: list[str] = Field(default_factory=lambda: [
-        "code", "notepad", "calc", "explorer", "chrome", "firefox",
-        "msedge", "powershell", "cmd", "ping", "ipconfig",
-        "systeminfo", "tasklist", "dir", "type", "echo",
+        "git", "echo", "dir", "type", "ping", "ipconfig", "systeminfo", "tasklist",
+        "notepad", "calc", "explorer", "code",
     ])
     blocked_commands: list[str] = Field(default_factory=lambda: [
         "rm -rf", "format", "del /s", "shutdown", "restart",
     ])
-    allowed_directories: list[str] = Field(default_factory=lambda: [
-        "~", "C:\\Users", "D:\\",
-    ])
+    allowed_directories: list[str] = Field(default_factory=lambda: ["~"])
     # None preserves legacy unrestricted targets; [] denies every target.
     allowed_applications: list[str] | None = None
     allowed_hosts: list[str] | None = None

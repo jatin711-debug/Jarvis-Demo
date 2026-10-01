@@ -38,7 +38,8 @@ ollama pull nomic-embed-text
 # 4. Install the Playwright browser (for web automation tools)
 playwright install chromium
 
-# 5. Run Jarvis
+# 5. Check the setup (Ollama, models, audio devices, packages), then run Jarvis
+jarvis --doctor   # prints what is wrong and how to fix it
 jarvis            # console entry point
 python -m jarvis  # equivalent
 python -m jarvis --text "How are you doing?"  # one turn without voice hardware
@@ -87,10 +88,11 @@ tests/
 ## Development
 
 ```bash
-pip install -e .[dev]   # pytest, pytest-asyncio, ruff
+pip install -e .[dev]   # pytest, pytest-asyncio, ruff, coverage
 
 pytest                  # run the unit suite (tests/unit)
 ruff check .            # lint
+coverage run -m pytest && coverage report   # coverage, with the floor CI enforces
 ```
 
 The unit suite mocks the LLM and needs no microphone, Ollama, or models.

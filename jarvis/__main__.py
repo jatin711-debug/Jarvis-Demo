@@ -1,7 +1,8 @@
 """
 JARVIS entry point: ``python -m jarvis`` or the ``jarvis`` console script.
 
-Exit codes: 0 ok, 1 startup failed, 2 invalid configuration, 130 interrupted.
+Exit codes: 0 ok, 1 startup failed (or --doctor found a problem), 2 invalid
+configuration, 130 interrupted.
 """
 
 import os
@@ -49,6 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="run one text turn without microphone, wake word, or speech output")
     parser.add_argument("--list-tools", action="store_true",
                         help="print every tool by surface, effect and confirmation, then exit")
+    parser.add_argument("--doctor", action="store_true",
+                        help="check Ollama, the model, audio devices and packages, then exit")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="show DEBUG diagnostics on the console (the log file always has them)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -74,6 +77,13 @@ async def main(argv: list[str] | None = None) -> int:
 
         print(render_tool_table(config), end="")
         return EXIT_OK
+
+    if args.doctor:
+        from jarvis import doctor
+
+        checks = await doctor.run_checks(config, resolve_config_path(args.config))
+        print(doctor.render(checks), end="")
+        return doctor.exit_code(checks)
 
     setup_logging(
         level="DEBUG" if args.verbose else config.system.log_level,
