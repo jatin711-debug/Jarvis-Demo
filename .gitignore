@@ -13,6 +13,9 @@ build/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
 
 # Local llama.cpp runtime experiment (binaries + GGUF models, large)
 /tools/

@@ -125,3 +125,12 @@ class TestShippedProfiles:
 
     def test_lfm_profile_loads(self):
         assert load_config(self.ROOT / "config.lfm.yaml").llm.provider == "huggingface"
+
+    def test_lfm_profile_inherits_the_safe_defaults_and_no_machine_settings(self):
+        base = load_config(self.ROOT / "config.yaml")
+        lfm = load_config(self.ROOT / "config.lfm.yaml")
+        assert lfm.security == base.security
+        assert lfm.voice == base.voice
+        assert lfm.voice.input_device is None, "device indexes belong in config.local.yaml"
+        assert lfm.memory.enabled is False
+        assert lfm.llm.model != base.llm.model

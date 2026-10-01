@@ -54,6 +54,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+    "coverage>=7.4",
 ]
 
 [project.scripts]
@@ -88,3 +89,21 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Env vars and warning suppression must run before any imports.
 "jarvis/__main__.py" = ["E402"]
+
+# ================================
+# Coverage
+# ================================
+# `coverage run -m pytest && coverage report`. The floor is a ratchet against
+# regressions, not a target: raise it when coverage rises.
+
+[tool.coverage.run]
+source = ["jarvis"]
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+fail_under = 55
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
