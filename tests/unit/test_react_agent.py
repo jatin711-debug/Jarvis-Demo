@@ -232,6 +232,56 @@ class TestActionClaimRetry:
         assert len(llm.calls) == 2
 
 
+    async def test_claiming_to_have_read_a_file_without_a_tool_is_caught(self):
+        llm = FakeLLM([
+            {"content": 'I read the file: "buy milk".'},
+            {"content": "Let me check that properly."},
+        ])
+        agent = ReActAgent(llm=llm, tools=ToolRegistry(), system_prompt="sys")
+        await agent.run("Explain gravity")
+        assert len(llm.calls) == 2
+
+    async def test_ordinary_talk_about_reading_is_not_a_claim(self):
+        llm = FakeLLM([{"content": "I read a book once, and files are just named data."}])
+        agent = ReActAgent(llm=llm, tools=ToolRegistry(), system_prompt="sys")
+        await agent.run("Explain gravity")
+        assert len(llm.calls) == 1
+
+
+def _registry_with_read_file() -> ToolRegistry:
+    registry = ToolRegistry()
+
+    @registry.tool(name="read_file", description="Read a file",
+                   parameters={"type": "object", "properties": {"file_path": {"type": "string"}},
+                               "required": ["file_path"]})
+    async def read_file(file_path: str):
+        return "buy milk"
+
+    return registry
+
+
+def _offered(call: dict) -> set[str]:
+    return {tool["function"]["name"] for tool in call["tools"] or []}
+
+
+class TestFollowUpTools:
+    async def test_a_follow_up_is_still_offered_the_tools_of_the_request_before(self):
+        llm = FakeLLM([{"content": "Done."}, {"content": "It says buy milk."}])
+        agent = ReActAgent(llm=llm, tools=_registry_with_read_file(), system_prompt="sys")
+        await agent.run("Please read the file notes.txt")
+        await agent.run("Now read it back to me.")
+        assert _offered(llm.calls[0]) == {"read_file"}
+        assert _offered(llm.calls[1]) == {"read_file"}
+
+    async def test_a_new_conversation_forgets_them(self):
+        llm = FakeLLM([{"content": "Done."}, {"content": "I am not sure what you mean."}])
+        agent = ReActAgent(llm=llm, tools=_registry_with_read_file(), system_prompt="sys")
+        await agent.run("Please read the file notes.txt")
+        agent.new_conversation()
+        await agent.run("Now read it back to me.")
+        assert _offered(llm.calls[1]) == set()
+
+
 class TestNativeFallbackDowngrade:
     async def test_http_400_switches_to_text_parsing(self):
         err = _http_400_tool_error()

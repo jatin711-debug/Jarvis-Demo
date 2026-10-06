@@ -5,6 +5,7 @@ import pytest
 from jarvis.agent.routing import (
     SYSTEM_CAPABILITIES,
     Surface,
+    is_follow_up,
     needs_vision,
     needs_web,
     route_request,
@@ -14,13 +15,14 @@ from jarvis.agent.routing import (
 ALL_SYSTEM_TOOLS = set().union(*SYSTEM_CAPABILITIES.values())
 
 
-def route(text, *, browser=True, desktop=True, active=False, tools=None):
+def route(text, *, browser=True, desktop=True, active=False, tools=None, previous=None):
     return route_request(
         text,
         system_tools=ALL_SYSTEM_TOOLS if tools is None else tools,
         browser_available=browser,
         desktop_available=desktop,
         desktop_active=active,
+        previous=previous,
     )
 
 
@@ -75,6 +77,78 @@ class TestDesktopFollowUps:
         assert route("open notepad", desktop=False).surface is not Surface.DESKTOP
 
 
+class TestFollowUps:
+    """"Now read it back" names no capability; without the last request's tools the model cannot act."""
+
+    def files(self):
+        return route("Create a file named todo.txt in the folder docs containing: buy milk",
+                     desktop=False, browser=False)
+
+    @pytest.mark.parametrize("text", [
+        "Now read it back to me.", "and delete that", "do it again", "what is in there",
+        "okay, the second one", "read it back", "Then move them somewhere else",
+    ])
+    def test_short_references_to_the_last_request_are_follow_ups(self, text):
+        assert is_follow_up(text)
+
+    @pytest.mark.parametrize("text", [
+        "Explain gravity", "What is 17 times 23?", "Tell me a joke", "Who wrote Hamlet",
+        "Explain how photosynthesis works in plants and why the leaves turn red in autumn it is odd",
+    ])
+    def test_new_questions_are_not_follow_ups(self, text):
+        assert not is_follow_up(text)
+
+    def test_a_follow_up_keeps_the_tools_of_the_last_request(self):
+        first = self.files()
+        assert first.surface is Surface.SYSTEM
+        second = route("Now read it back to me.", desktop=False, browser=False, previous=first)
+        assert second.surface is Surface.SYSTEM
+        assert "read_file" in second.system_tools and "write_file" in second.system_tools
+        assert second.groups == first.groups
+
+    def test_without_a_previous_request_it_is_just_chat(self):
+        assert route("Now read it back to me.", desktop=False, browser=False).surface is Surface.CHAT
+
+    def test_a_write_verb_after_files_were_in_play_is_unambiguous(self):
+        listing = route("list the files in my downloads", desktop=False, browser=False)
+        assert "delete_file" not in listing.system_tools
+        deleting = route("delete it", desktop=False, browser=False, previous=listing)
+        assert deleting.surface is Surface.SYSTEM
+        assert {"delete_file", "list_directory"} <= deleting.system_tools
+
+    def test_it_carries_on_through_a_chain_of_follow_ups(self):
+        first = route("list the files in my downloads", desktop=False, browser=False)
+        second = route("now delete it", desktop=False, browser=False, previous=first)
+        third = route("and move that too", desktop=False, browser=False, previous=second)
+        assert {"list_directory", "delete_file", "move_file"} <= third.system_tools
+
+    def test_a_chat_answer_in_between_ends_the_chain(self):
+        files = self.files()
+        chat = route("Explain gravity", desktop=False, browser=False, previous=files)
+        assert chat.surface is Surface.CHAT
+        assert route("tell me more about it", desktop=False, browser=False,
+                     previous=chat).surface is Surface.CHAT
+
+    def test_a_request_with_its_own_capability_is_not_widened(self):
+        result = route("what time is it", desktop=False, browser=False, previous=self.files())
+        assert result.groups == ("clock",) and result.system_tools == {"get_datetime"}
+
+    def test_a_long_new_question_does_not_inherit_tools(self):
+        question = "Explain how photosynthesis works in plants and why the leaves turn red in autumn it is odd"
+        assert route(question, desktop=False, browser=False,
+                     previous=self.files()).surface is Surface.CHAT
+
+    def test_a_browser_follow_up_stays_in_the_browser(self):
+        searched = route("search youtube for cats", desktop=False)
+        assert searched.surface is Surface.BROWSER
+        assert route("play the first one", desktop=False, previous=searched).surface is Surface.BROWSER
+        assert route("play the first one", desktop=False, browser=False,
+                     previous=searched).surface is not Surface.BROWSER
+
+    def test_small_talk_stays_small_talk(self):
+        assert route("thanks", previous=self.files()).surface is Surface.SMALL_TALK
+
+
 class TestWebDetection:
     @pytest.mark.parametrize("text", [
         "what time is it", "open notepad", "list the files in my downloads",
@@ -100,6 +174,21 @@ class TestVision:
     ])
     def test_non_visual_requests(self, text):
         assert not needs_vision(text)
+
+    @pytest.mark.parametrize("text", [
+        "Find the file report-2026.txt somewhere inside the folder docs",
+        "Read the file C:/Windows/win.ini and show me what it says.",
+        "look at the files in my downloads", "where is my project folder", "locate the repo",
+    ])
+    def test_file_requests_never_take_a_screenshot(self, text):
+        assert not needs_vision(text)
+
+    @pytest.mark.parametrize("text", [
+        "find the save button", "look at this", "show me my screen", "where is the start menu icon",
+        "click the blue one",
+    ])
+    def test_looking_phrases_still_mean_the_screen_when_no_file_is_named(self, text):
+        assert needs_vision(text)
 
     def test_desktop_route_skips_screenshots(self):
         assert not route("click the save button").vision

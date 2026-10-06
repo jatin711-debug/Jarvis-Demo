@@ -13,6 +13,10 @@ small, relevant menu instead of every tool. Surfaces are mutually exclusive:
 Routing is tool exposure, not authorization: the permission gateway still
 checks every call. Unknown tools are not offered until a capability route
 is defined for them.
+
+A short follow-up with no capability words of its own ("now read it back",
+"delete that", "scroll down") would route to ``chat`` and leave the model with
+no tools to act with, so it keeps the surface of the previous request instead.
 """
 
 from __future__ import annotations
@@ -109,14 +113,32 @@ _DESKTOP_FOLLOW_UP = re.compile(r"\b(it|that|this|there|next|again)\b", re.IGNOR
 _VISION = re.compile(
     r"\b(screen|screenshot|what do you see|what's on my screen|"
     r"this window|this dialog|this error|this message|"
-    r"look at|can you see|show me|"
-    r"click the|where is|find the|locate the|"
-    r"button|icon|menu bar|taskbar|desktop)\b",
+    r"can you see|button|icon|menu bar|taskbar|desktop)\b",
     re.IGNORECASE,
 )
+# Phrases that also begin plenty of file requests ("find the file", "show me what it says"):
+# they mean the screen only when the request is not about files or folders.
+_VISION_WEAK = re.compile(
+    r"\b(look at|show me|click the|where is|find the|locate the)\b", re.IGNORECASE)
+
+
+# Words that tie a short request to the one before it: an opener ("now ...", "and ...") or a
+# reference back ("it", "that one", "again").
+_FOLLOW_UP = re.compile(
+    r"^\W*(?:and|also|now|then|so|next|ok|okay)\b"
+    r"|\b(?:it|its|that|this|those|these|them|there|again|back|same|too|instead|another|else|"
+    r"more|one)\b",
+    re.IGNORECASE,
+)
+_FOLLOW_UP_MAX_WORDS = 12  # a long sentence with no capability words is a new question, not a follow-up
 
 
 # ── Predicates ──────────────────────────────────────────────────────
+
+def is_follow_up(text: str) -> bool:
+    """True for a short request that leans on the previous one ("now read it back")."""
+    return len(text.split()) <= _FOLLOW_UP_MAX_WORDS and bool(_FOLLOW_UP.search(text))
+
 
 def is_small_talk(text: str) -> bool:
     normalized = re.sub(r"[^\w\s']", "", text.casefold()).strip()
@@ -142,17 +164,21 @@ def needs_web(text: str) -> bool:
 
 def needs_vision(text: str) -> bool:
     """True when the request implies looking at the screen."""
-    return bool(_VISION.search(text))
+    if _VISION.search(text):
+        return True
+    return bool(_VISION_WEAK.search(text)) and not _LOCAL_FILES.search(text)
 
 
-def select_system_tools(text: str, available: set[str]) -> tuple[set[str], tuple[str, ...]]:
+def select_system_tools(text: str, available: set[str],
+                        carried: tuple[str, ...] = ()) -> tuple[set[str], tuple[str, ...]]:
     """Choose the system tools that match the request's capabilities.
 
-    Returns ``(tool_names, matched_groups)``, limited to ``available`` tools.
+    ``carried`` are the groups of the previous request: files already in play make a write verb
+    ("delete it") unambiguous. Returns ``(tool_names, matched_groups)``, limited to ``available``.
     """
     message = text.casefold()
     groups = [name for name, pattern in _SYSTEM_PATTERNS if re.search(pattern, message)]
-    if "files_write" in groups and "files_read" not in groups:
+    if "files_write" in groups and "files_read" not in groups and "files_read" not in carried:
         groups.remove("files_write")  # write verbs alone are too ambiguous to offer file writes
     selected: set[str] = set()
     for group in groups:
@@ -169,12 +195,15 @@ def route_request(
     browser_available: bool = False,
     desktop_available: bool = False,
     desktop_active: bool = False,
+    previous: Route | None = None,
 ) -> Route:
     """
     Pick the tool surface for ``text``.
 
     ``desktop_active`` marks an ongoing desktop task, which lets short
-    follow-ups ("do that again") stay on the desktop surface.
+    follow-ups ("do that again") stay on the desktop surface. ``previous`` is the route of
+    the request before this one: a short follow-up that names no capability of its own keeps
+    its system or browser tools.
     """
     if is_small_talk(text):
         return Route(Surface.SMALL_TALK)
@@ -187,5 +216,12 @@ def route_request(
         return Route(Surface.BROWSER, vision=needs_vision(text))
 
     tools, groups = select_system_tools(text, system_tools)
-    return Route(Surface.SYSTEM if tools else Surface.CHAT, frozenset(tools), groups,
-                 vision=needs_vision(text))
+    vision = needs_vision(text)
+    if not tools and previous is not None and is_follow_up(text):
+        if previous.surface is Surface.SYSTEM:
+            extra, extra_groups = select_system_tools(text, system_tools, carried=previous.groups)
+            return Route(Surface.SYSTEM, previous.system_tools | frozenset(extra),
+                         tuple(dict.fromkeys([*previous.groups, *extra_groups])), vision=vision)
+        if previous.surface is Surface.BROWSER and browser_available:
+            return Route(Surface.BROWSER, vision=vision)
+    return Route(Surface.SYSTEM if tools else Surface.CHAT, frozenset(tools), groups, vision=vision)

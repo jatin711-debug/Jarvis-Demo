@@ -181,9 +181,15 @@ class ReActAgent:
         self._browser_tools = browser_tools
         self._desktop_tools = desktop_tools
         self._desktop_active = False
+        self._last_route: Route | None = None  # lets "now read it back" keep the last request's tools
         self._base_system_prompt = system_prompt
         # None = native tool support unknown (optimistic), False = disabled
         self._native_tools_ok: bool | None = (llm.provider in ("ollama", "llamacpp")) or None
+
+    def new_conversation(self) -> None:
+        """Forget which tools the previous request used, so a follow-up cannot inherit them."""
+        self._desktop_active = False
+        self._last_route = None
 
     # ── Tool lookup ─────────────────────────────────────────
 
@@ -378,8 +384,10 @@ class ReActAgent:
             browser_available=self._browser_tools is not None,
             desktop_available=self._desktop_tools is not None,
             desktop_active=self._desktop_active,
+            previous=self._last_route,
         )
         self._desktop_active = route.surface is Surface.DESKTOP
+        self._last_route = route
         logger.info("route %s", route.describe())
 
         if route.surface is Surface.SMALL_TALK:

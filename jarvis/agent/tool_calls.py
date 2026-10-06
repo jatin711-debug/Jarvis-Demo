@@ -51,7 +51,12 @@ ACTION_CLAIM_PATTERNS = re.compile(
     r"i(?:'ve| have) launched|i(?:'ve| have) started|"
     r"has launched|opened for you|searched for|navigated to|"
     r"calling the .+ tool|has been saved|i(?:'ve| have) saved|i(?:'ve| have) typed|"
-    r"calculator has|browser has|chrome has|youtube has|google has)\b",
+    r"calculator has|browser has|chrome has|youtube has|google has|"
+    # Files and folders: "I read the file", "the file was created".
+    r"i(?:'ve| have)? (?:read|created|wrote|written|deleted|removed|moved|copied|renamed|listed) "
+    r"(?:the|that|your|a|an) (?:file|folder|directory|document)|"
+    r"(?:file|folder|directory) (?:has been|was|is now) (?:created|written|deleted|removed|moved|"
+    r"copied|renamed))\b",
     re.IGNORECASE,
 )
 
