@@ -183,7 +183,7 @@ class ReActAgent:
         self._desktop_active = False
         self._base_system_prompt = system_prompt
         # None = native tool support unknown (optimistic), False = disabled
-        self._native_tools_ok: bool | None = (llm.provider == "ollama") or None
+        self._native_tools_ok: bool | None = (llm.provider in ("ollama", "llamacpp")) or None
 
     # ── Tool lookup ─────────────────────────────────────────
 

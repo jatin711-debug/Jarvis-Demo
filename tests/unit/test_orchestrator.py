@@ -327,7 +327,7 @@ class TestStartupWiring:
         config.desktop.backend = "legacy"
         fake_llm = SimpleNamespace(provider="ollama", startup=AsyncMock(), shutdown=AsyncMock(),
                                    config=config.llm)
-        monkeypatch.setattr(orch, "LLMClient", lambda cfg: fake_llm)
+        monkeypatch.setattr(orch, "LLMClient", lambda cfg, **kwargs: fake_llm)
         return config
 
     async def test_text_mode_starts_without_voice_and_wires_confirmation(self, wired, caplog):
@@ -379,7 +379,7 @@ class TestVoiceStartupFailures:
         config.desktop.backend = "legacy"
         fake_llm = SimpleNamespace(provider="ollama", startup=AsyncMock(), shutdown=AsyncMock(),
                                    config=config.llm)
-        monkeypatch.setattr(orch, "LLMClient", lambda cfg: fake_llm)
+        monkeypatch.setattr(orch, "LLMClient", lambda cfg, **kwargs: fake_llm)
         return Orchestrator(config)
 
     @staticmethod

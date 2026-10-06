@@ -3,6 +3,7 @@ JARVIS LLM Client
 ==================
 Multi-provider LLM client:
 - Ollama: local Ollama API (default)
+- llama.cpp: a running ``llama-server`` (OpenAI-compatible API, GGUF models)
 - HuggingFace: Direct Transformers inference (for LFM, etc.)
 """
 
@@ -10,13 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import threading
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from typing import Any
+from pathlib import Path
+from typing import Any, NoReturn
 
 import httpx
 
+from jarvis.agent.llama_server import LlamaServer
 from jarvis.utils.config import LLMConfig
 from jarvis.utils.logger import get_logger
 
@@ -26,6 +30,12 @@ logger = get_logger(__name__)
 _API_CHAT = "/api/chat"
 _API_TAGS = "/api/tags"
 
+# llama-server (llama.cpp) endpoints
+_API_OPENAI_CHAT = "/v1/chat/completions"
+_API_HEALTH = "/health"
+_API_PROPS = "/props"
+_LLAMACPP_READY_WAIT_S = 90.0   # a cold model load can take this long; /health answers 503 meanwhile
+
 
 class LLMClient:
     """
@@ -33,24 +43,110 @@ class LLMClient:
 
     Providers:
     - Ollama: local Ollama API (default)
+    - llama.cpp: a running llama-server (GGUF models)
     - HuggingFace: Direct Transformers inference (LFM, etc.)
     """
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(self, config: LLMConfig, log_dir: Path | None = None) -> None:
         self.config = config
         self.provider = config.provider.lower()
         self.base_url = config.base_url.rstrip("/")
+        self._log_dir = log_dir or Path(tempfile.gettempdir())
         self._client: httpx.AsyncClient | None = None
         self._hf_model = None
         self._hf_tokenizer = None
         self._hf_lock = asyncio.Lock()
+        self._server: LlamaServer | None = None  # llama-server, when Jarvis started it
+        self._server_vision = False  # llama-server: was it started with a multimodal projector?
 
     async def startup(self) -> None:
         """Initialize the LLM client based on provider."""
         if self.provider == "huggingface":
             await self._startup_huggingface()
+        elif self.provider == "llamacpp":
+            await self._startup_llamacpp()
         else:
             await self._startup_ollama()
+
+    async def _startup_llamacpp(self) -> None:
+        """Connect to llama-server, waiting for it to finish loading its model."""
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(self.config.request_timeout, connect=10.0),
+        )
+        if self.config.server.model and await self._llamacpp_status() is None:
+            self._server = LlamaServer(self.config, self._log_dir / "llama-server.log")
+            try:
+                await self._server.start()
+            except RuntimeError as exc:
+                await self._abort_startup(str(exc))
+
+        loop = asyncio.get_running_loop()
+        wait_s = self.config.server.startup_timeout if self._server else _LLAMACPP_READY_WAIT_S
+        deadline = loop.time() + wait_s
+        announced = False
+        while True:
+            status = await self._llamacpp_status()
+            if status == 200:
+                break
+            if self._server is not None and not self._server.alive():
+                await self._abort_startup(
+                    "llama-server exited during startup. Last output:\n" + self._server.log_tail())
+            if status is None and self._server is None:
+                await self._abort_startup(
+                    f"Cannot reach llama-server at {self.base_url}. Start it first, e.g.: "
+                    "llama-server -m <model.gguf> --port 8080 -ngl 99 -fa on, or set "
+                    "llm.server.model so Jarvis starts it (see docs/llamacpp.md)")
+            if status not in (None, 503):
+                await self._abort_startup(
+                    f"llama-server at {self.base_url} is unhealthy (HTTP {status})")
+            if loop.time() >= deadline:
+                await self._abort_startup(
+                    f"llama-server at {self.base_url} is still loading its model after {wait_s:.0f}s")
+            if not announced:
+                logger.info("waiting for llama-server to load its model url=%s", self.base_url)
+                announced = True
+            await asyncio.sleep(1.0)
+
+        props = await self._server_props()
+        self._server_vision = bool((props.get("modalities") or {}).get("vision"))
+        n_ctx = (props.get("default_generation_settings") or {}).get("n_ctx")
+        logger.info("llama-server connected url=%s model=%s n_ctx=%s vision=%s",
+                    self.base_url, props.get("model_alias") or self.config.model,
+                    n_ctx, self._server_vision)
+        if isinstance(n_ctx, int) and n_ctx < self.config.context_window:
+            logger.warning("llama-server context (%d) is smaller than llm.context_window (%d); "
+                           "start it with -c %d", n_ctx, self.config.context_window,
+                           self.config.context_window)
+
+    async def _llamacpp_status(self) -> int | None:
+        """HTTP status of llama-server's /health, or None when nothing answers."""
+        assert self._client is not None
+        try:
+            return (await self._client.get(_API_HEALTH)).status_code
+        except httpx.HTTPError:
+            return None
+
+    async def _server_props(self) -> dict[str, Any]:
+        """llama-server's /props, or {} when unavailable (it is informational only)."""
+        assert self._client is not None
+        try:
+            resp = await self._client.get(_API_PROPS)
+            resp.raise_for_status()
+            props = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return {}
+        return props if isinstance(props, dict) else {}
+
+    async def _abort_startup(self, message: str) -> NoReturn:
+        """Release what startup acquired (client, a server we launched) and raise ``message``."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        if self._server is not None:
+            await self._server.stop()
+            self._server = None
+        raise RuntimeError(message)
 
     async def _startup_ollama(self) -> None:
         """Initialize Ollama HTTP client and verify the configured model exists."""
@@ -128,18 +224,34 @@ class LLMClient:
         if self._client:
             await self._client.aclose()
             self._client = None
+        if self._server is not None:
+            await self._server.stop()
+            self._server = None
         self._hf_model = None
         self._hf_tokenizer = None
 
     @property
     def supports_images(self) -> bool:
-        """Whether this provider can look at attached images (the HF path is text-only)."""
+        """Whether this provider can look at attached images.
+
+        The HF path is text-only; llama-server reads images only when it was
+        started with a multimodal projector (``--mmproj``).
+        """
+        if self.provider == "llamacpp":
+            return self._server_vision
         return self.provider != "huggingface"
 
     async def health_check(self) -> bool:
         """Check if provider is running/available."""
         if self.provider == "huggingface":
             return self._hf_model is not None
+        if self.provider == "llamacpp":
+            if self._client is None:
+                return False
+            try:
+                return (await self._client.get(_API_HEALTH)).status_code == 200
+            except httpx.HTTPError:
+                return False
         models = await self.list_models()
         if models is None:
             return False
@@ -189,6 +301,8 @@ class LLMClient:
             return await self._chat_huggingface(
                 messages, temperature, max_tokens
             )
+        if self.provider == "llamacpp":
+            return await self._chat_llamacpp(messages, tools, temperature, max_tokens, images)
         return await self._chat_ollama(
             messages, tools, temperature, max_tokens, images
         )
@@ -294,7 +408,8 @@ class LLMClient:
 
         full_text = ""
         tool_calls: list[dict[str, Any]] = []
-        async with aclosing(self._stream_ollama(
+        raw_stream = self._stream_llamacpp if self.provider == "llamacpp" else self._stream_ollama
+        async with aclosing(raw_stream(
             messages, tools, temperature, max_tokens, images
         )) as stream:
             async for kind, payload in stream:
@@ -352,6 +467,175 @@ class LLMClient:
                     break
             if not finished:
                 raise httpx.RemoteProtocolError("Ollama closed the stream before the reply finished")
+
+    # ── llama.cpp (llama-server, OpenAI-compatible) ─────────
+
+    async def _chat_llamacpp(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        images: list[str] | None,
+    ) -> dict[str, Any]:
+        """A whole reply, assembled from the stream (llama-server is only called streamed)."""
+        content = ""
+        tool_calls: list[dict[str, Any]] = []
+        async with aclosing(self._stream_llamacpp(
+            messages, tools, temperature, max_tokens, images
+        )) as stream:
+            async for kind, payload in stream:
+                if kind == "content":
+                    content += payload
+                elif kind == "tool_calls":
+                    tool_calls.extend(payload)
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        logger.debug("llamacpp response chars=%d tool_calls=%d", len(content), len(tool_calls))
+        return {"message": message}
+
+    def _openai_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        images: list[str] | None,
+    ) -> dict[str, Any]:
+        """The streamed /v1/chat/completions request body."""
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": self._openai_messages(messages, images),
+            "stream": True,
+            "cache_prompt": True,  # reuse the KV cache of the unchanged prompt prefix
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": max_tokens or self.config.max_tokens,
+        }
+        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
+        if "qwen3.5" in self.config.model.lower():
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    @staticmethod
+    def _openai_messages(messages: list[dict[str, Any]],
+                         images: list[str] | None) -> list[dict[str, Any]]:
+        """Conversation history in OpenAI shape.
+
+        The agent keeps Ollama-shaped history (tool-call arguments as objects,
+        tool results identified by name). OpenAI wants JSON-string arguments and
+        a ``tool_call_id`` that pairs each result with its call.
+        """
+        converted: list[dict[str, Any]] = []
+        unanswered: list[str] = []
+        issued = 0
+        for source in messages:
+            message = dict(source)
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                calls = []
+                for call in message["tool_calls"]:
+                    function = call.get("function", {})
+                    arguments = function.get("arguments", {})
+                    issued += 1
+                    unanswered.append(f"call_{issued}")
+                    calls.append({
+                        "id": unanswered[-1],
+                        "type": "function",
+                        "function": {
+                            "name": function.get("name", ""),
+                            "arguments": arguments if isinstance(arguments, str)
+                            else json.dumps(arguments),
+                        },
+                    })
+                message["tool_calls"] = calls
+            elif message.get("role") == "tool":
+                message["tool_call_id"] = unanswered.pop(0) if unanswered else "call_0"
+            converted.append(message)
+
+        if images:
+            # Images belong to the most recent user message.
+            for message in reversed(converted):
+                if message.get("role") == "user":
+                    message["content"] = [{"type": "text", "text": message.get("content", "")}] + [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}}
+                        for image in images
+                    ]
+                    break
+        return converted
+
+    async def _stream_llamacpp(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        images: list[str] | None = None,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Raw llama-server stream: yields ("content", token), then ("tool_calls", [...]) once.
+
+        Tool calls arrive as fragments; they are assembled and emitted in the
+        Ollama shape (arguments as an object) when the reply finishes. Like the
+        Ollama path, a stream that ends before the finish marker is an error.
+        """
+        assert self._client is not None, "Call startup() first"
+        payload = self._openai_payload(messages, tools, temperature, max_tokens, images)
+
+        pending: dict[int, dict[str, str]] = {}
+        finished = False
+        async with self._client.stream("POST", _API_OPENAI_CHAT, json=payload) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()  # so the caller can read the error text
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue  # blank separators and ": keep-alive" comments
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    finished = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    logger.debug("llamacpp stream line skipped (not json) chars=%d", len(data))
+                    continue
+                if chunk.get("error"):
+                    error = chunk["error"]
+                    detail = error.get("message") if isinstance(error, dict) else error
+                    raise RuntimeError(f"llama-server reported an error: {detail}")
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    token = delta.get("content")
+                    if token:
+                        yield ("content", token)
+                    for fragment in delta.get("tool_calls") or []:
+                        slot = pending.setdefault(fragment.get("index", 0),
+                                                  {"name": "", "arguments": ""})
+                        function = fragment.get("function") or {}
+                        if function.get("name") and not slot["name"]:
+                            slot["name"] = function["name"]
+                        slot["arguments"] += function.get("arguments") or ""
+                    if choice.get("finish_reason"):
+                        finished = True
+        if not finished:
+            raise httpx.RemoteProtocolError("llama-server closed the stream before the reply finished")
+
+        calls = []
+        for _, slot in sorted(pending.items()):
+            if not slot["name"]:
+                continue
+            try:
+                arguments = json.loads(slot["arguments"]) if slot["arguments"].strip() else {}
+            except ValueError:
+                logger.warning("tool call arguments are not valid JSON tool=%s chars=%d",
+                               slot["name"], len(slot["arguments"]))
+                arguments = {}
+            calls.append({"function": {"name": slot["name"], "arguments": arguments}})
+        if calls:
+            yield ("tool_calls", calls)
 
     async def _chat_stream_huggingface(
         self,

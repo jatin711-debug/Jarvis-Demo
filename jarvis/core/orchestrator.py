@@ -146,7 +146,7 @@ class Orchestrator:
 
         expand_path(cfg.system.data_dir).mkdir(parents=True, exist_ok=True)
 
-        self.llm = LLMClient(cfg.llm)
+        self.llm = LLMClient(cfg.llm, log_dir=expand_path(cfg.system.log_dir))
         await self.llm.startup()
 
         # System tools are always offered per request; browser and desktop

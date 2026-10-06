@@ -74,6 +74,50 @@ class TestOllama:
         assert check.status == FAIL
 
 
+def llama_server(health=200, props=None):
+    def handler(request):
+        if request.url.path == "/health":
+            return httpx.Response(health, json={})
+        assert request.url.path == "/props"
+        return httpx.Response(200, json=props or {})
+    return httpx.MockTransport(handler)
+
+
+class TestLlamaServer:
+    PROPS = {"model_alias": "qwen3.5-4b", "modalities": {"vision": False},
+             "default_generation_settings": {"n_ctx": 4096}}
+
+    async def test_healthy_server_names_its_model(self):
+        checks = by_name(await doctor.check_llamacpp(
+            config(llm={"provider": "llamacpp", "context_window": 4096}),
+            llama_server(props=self.PROPS)))
+        assert checks["llama-server"].status == OK
+        assert checks["chat model"].status == OK and "qwen3.5-4b" in checks["chat model"].detail
+        assert "server context" not in checks
+
+    async def test_unreachable_server_says_how_to_start_it(self):
+        def refuse(request):
+            raise httpx.ConnectError("refused")
+
+        [check] = await doctor.check_llamacpp(config(), httpx.MockTransport(refuse))
+        assert check.status == FAIL and "llama-server -m" in check.hint
+
+    async def test_a_server_still_loading_is_a_warning(self):
+        [check] = await doctor.check_llamacpp(config(), llama_server(health=503))
+        assert check.status == WARN
+
+    async def test_an_unhealthy_server_is_a_failure(self):
+        [check] = await doctor.check_llamacpp(config(), llama_server(health=500))
+        assert check.status == FAIL
+
+    async def test_a_context_smaller_than_the_configured_window_warns(self):
+        props = {**self.PROPS, "default_generation_settings": {"n_ctx": 2048}}
+        checks = by_name(await doctor.check_llamacpp(
+            config(llm={"context_window": 4096}), llama_server(props=props)))
+        assert checks["server context"].status == WARN
+        assert "-c 4096" in checks["server context"].hint
+
+
 class TestAudio:
     def test_default_microphone(self):
         checks = by_name(doctor.check_audio(config(), FakeSounddevice([MIC, SPEAKER])))
@@ -206,6 +250,16 @@ async def test_run_checks_skips_ollama_for_the_huggingface_provider(tmp_path):
         cfg, None, find=lambda name: object(), sd=FakeSounddevice([MIC, SPEAKER])))
     assert "ollama" not in checks and "chat model" not in checks
     assert checks["config"].status == WARN
+
+
+async def test_run_checks_uses_the_llama_server_check_for_the_llamacpp_provider(tmp_path):
+    cfg = config(llm={"provider": "llamacpp", "model": "x"},
+                 system={"data_dir": str(tmp_path), "log_dir": str(tmp_path)})
+    checks = by_name(await doctor.run_checks(
+        cfg, None, transport=llama_server(props=TestLlamaServer.PROPS),
+        find=lambda name: object(), sd=FakeSounddevice([MIC, SPEAKER])))
+    assert checks["llama-server"].status == OK
+    assert "ollama" not in checks
 
 
 async def test_cli_doctor_prints_the_report_and_returns_its_exit_code(tmp_path, monkeypatch, capsys):

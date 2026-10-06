@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from jarvis.agent.llama_server import build_command
 from jarvis.utils.config import JarvisConfig, expand_path
 from jarvis.voice.devices import default_hostapi, describe, resolve_device
 
@@ -150,6 +151,56 @@ async def check_ollama(config: JarvisConfig,
     return checks
 
 
+def check_llama_server_launch(config: JarvisConfig) -> Check:
+    """llama-server is not running: can Jarvis start it from ``llm.server``?"""
+    try:
+        command = build_command(config.llm)
+    except RuntimeError as exc:
+        return Check("llama-server", FAIL, f"not running, and Jarvis cannot start it: {exc}",
+                     "fix llm.server in your config (see docs/llamacpp.md)")
+    return Check("llama-server", OK, f"not running yet; Jarvis will start {Path(command[0]).name} "
+                 f"with {Path(config.llm.server.model or '').name}")
+
+
+async def check_llamacpp(config: JarvisConfig,
+                         transport: httpx.AsyncBaseTransport | None = None) -> list[Check]:
+    """Reachability of llama-server, its loaded model, and whether its context is big enough."""
+    base = config.llm.base_url.rstrip("/")
+    start_hint = "start it with: llama-server -m <model.gguf> --port 8080 -ngl 99 (see docs/llamacpp.md)"
+    try:
+        async with httpx.AsyncClient(base_url=base, timeout=3.0, transport=transport) as client:
+            health = await client.get("/health")
+            props: dict[str, Any] = {}
+            if health.status_code == 200:
+                try:
+                    props = (await client.get("/props")).json()
+                except (httpx.HTTPError, ValueError):
+                    props = {}
+    except httpx.HTTPError as exc:
+        if config.llm.server.model:
+            return [check_llama_server_launch(config)]
+        return [Check("llama-server", FAIL, f"cannot reach {base} ({type(exc).__name__})", start_hint)]
+
+    if health.status_code == 503:
+        return [Check("llama-server", WARN, f"{base} is still loading its model",
+                      "wait a few seconds and run --doctor again")]
+    if health.status_code != 200:
+        return [Check("llama-server", FAIL, f"{base} answered HTTP {health.status_code}", start_hint)]
+
+    checks = [Check("llama-server", OK, f"reachable at {base}")]
+    if not isinstance(props, dict):
+        return checks
+    model = props.get("model_alias") or Path(str(props.get("model_path") or "")).name or "(unknown)"
+    vision = bool((props.get("modalities") or {}).get("vision"))
+    checks.append(Check("chat model", OK, f"{model} ({'with' if vision else 'no'} image input)"))
+    n_ctx = (props.get("default_generation_settings") or {}).get("n_ctx")
+    if isinstance(n_ctx, int) and n_ctx < config.llm.context_window:
+        checks.append(Check("server context", WARN,
+                            f"{n_ctx} tokens, but llm.context_window is {config.llm.context_window}",
+                            f"restart llama-server with -c {config.llm.context_window}"))
+    return checks
+
+
 def check_audio(config: JarvisConfig, sd: Any = None) -> list[Check]:
     """Audio devices, including whether the configured microphone index is usable."""
     if sd is None:
@@ -212,6 +263,8 @@ async def run_checks(config: JarvisConfig, config_path: Path | None,
     checks = [check_python(), check_config(config_path), check_security(config)]
     if config.llm.provider == "ollama":
         checks += await check_ollama(config, transport)
+    elif config.llm.provider == "llamacpp":
+        checks += await check_llamacpp(config, transport)
     checks += check_packages(config, find)
     browser = check_browser_binary(find)
     if browser is not None:

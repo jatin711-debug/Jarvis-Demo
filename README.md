@@ -7,7 +7,7 @@ A fully local, voice-enabled AI assistant with intelligent memory, natural speec
 - Wake word detection (OpenWakeWord) with echo suppression
 - Streaming responses — sentences are spoken as the LLM generates them
 - **Barge-in** — interrupt Jarvis mid-response just by talking
-- ReAct agent with native Ollama tool calling + automatic text-parsing fallback
+- ReAct agent with native tool calling (Ollama or llama.cpp) + automatic text-parsing fallback
 - Optional Cua desktop backend and resumable fixture/Calculator acceptance workflows
 - ~40 tools: shell, files, apps, windows, clipboard, browser (Playwright), vision, scheduler, web search
 - Long-term memory (Mem0 + ChromaDB), 100% local embeddings
@@ -48,6 +48,10 @@ python -m jarvis --text "How are you doing?"  # one turn without voice hardware
 The Piper TTS voice model is auto-downloaded to `~/.jarvis/piper_voices/` on first run
 (only when `voice.tts.engine: "piper"`).
 
+**Smaller, faster on a consumer GPU:** [llama.cpp](docs/llamacpp.md) runs the same Qwen model as a
+text-only GGUF that fits a 4 GB card entirely (Ollama's bundled vision encoder pushes it onto the
+CPU) and Jarvis can start and stop `llama-server` for you.
+
 ### Configuration
 `config.yaml` holds the safe defaults. Put machine-specific changes (audio device,
 wider permissions) in an untracked `config.local.yaml` that starts with
@@ -82,7 +86,7 @@ tests/
 ```
 
 ## Tech Stack
-- **LLM**: Qwen 3.5 (via Ollama, native tool calling; HuggingFace provider experimental)
+- **LLM**: Qwen 3.5 (via Ollama or llama.cpp, native tool calling; HuggingFace provider experimental)
 - **STT**: faster-whisper (distil-small.en, int8)
 - **TTS**: Kokoro-82M (default) or Piper
 - **Wake Word**: OpenWakeWord

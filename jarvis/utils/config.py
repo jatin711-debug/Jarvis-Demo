@@ -53,8 +53,22 @@ class VoiceConfig(BaseModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
 
 
+class LlamaServerConfig(BaseModel):
+    """How Jarvis starts ``llama-server`` itself (``llm.provider: llamacpp``).
+
+    Without a ``model`` nothing is launched: Jarvis connects to a server you run.
+    """
+
+    model: str | None = None   # path to a .gguf file; setting it turns on auto-start
+    command: str = "llama-server"   # a name on PATH, or a full path
+    mmproj: str | None = None  # multimodal projector for image input; omit for text-only (saves VRAM)
+    # Flags between builds change (e.g. --no-mmap became -lm none); these two are stable.
+    args: list[str] = Field(default_factory=lambda: ["-ngl", "99", "-fa", "on"])
+    startup_timeout: float = Field(default=120.0, gt=0)
+
+
 class LLMConfig(BaseModel):
-    provider: Literal["ollama", "huggingface"] = "ollama"
+    provider: Literal["ollama", "llamacpp", "huggingface"] = "ollama"
     model: str = "qwen3:1.7b"
     base_url: str = "http://localhost:11434"
     max_tokens: int = Field(default=512, gt=0)
@@ -67,6 +81,7 @@ class LLMConfig(BaseModel):
     first_response_timeout: float = Field(default=30.0, gt=0)
     max_tool_result_chars: int = Field(default=4000, ge=512)
     max_history_chars: int = Field(default=8000, ge=0)
+    server: LlamaServerConfig = Field(default_factory=LlamaServerConfig)  # llamacpp provider only
     system_prompt: str = (
         "You are Jarvis, a helpful local AI assistant. "
         "Be concise, helpful, and proactive."

@@ -1,0 +1,22 @@
+# Optional llama.cpp profile: config.yaml with a llama-server backend instead of Ollama.
+# Everything not listed here (voice, security, desktop, ...) comes from config.yaml.
+# Run with:  python -m jarvis --config config.llamacpp.yaml     (see docs/llamacpp.md)
+#
+# Without llm.server.model Jarvis connects to a llama-server you start yourself. To have
+# Jarvis start and stop it, add this to config.local.yaml (the paths are per machine):
+#
+#   llm:
+#     server:
+#       command: "C:/path/to/llama-server.exe"
+#       model: "C:/path/to/Qwen3.5-4B-Q4_K_M.gguf"
+#       args: ["-ngl", "99", "-fa", "on"]
+extends: config.yaml
+
+llm:
+  provider: llamacpp
+  model: qwen3.5-4b                  # a label: llama-server serves the GGUF it was started with
+  base_url: "http://127.0.0.1:8080"
+  context_window: 4096               # becomes llama-server's -c when Jarvis starts it
+
+memory:
+  enabled: false                     # Mem0 still extracts and embeds through Ollama
