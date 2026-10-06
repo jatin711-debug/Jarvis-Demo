@@ -55,6 +55,12 @@ each including Python start-up. That is too small a sample to rank them; per Qwe
   with your `args` plus `-m <model> --host --port -c <context_window> -np 1 --alias <llm.model>`
   (Jarvis's flags come last, so they win), waits until the model is loaded, and stops it on exit.
 - A server that is already running is used as it is and never stopped by Jarvis.
+- If a server Jarvis started dies (killed for memory, a driver reset), it is restarted before the
+  next request. A request that loses the server before any of its reply was produced is sent
+  again once; a reply cut off part-way is reported as an error rather than replayed, and the
+  following request restarts the server. A restart that fails (or never finishes loading) is
+  reported with the reason and stops the half-started server. A server you started yourself is
+  never restarted by Jarvis.
 - If Jarvis is killed without shutting down, its server keeps running (holding the VRAM). The next
   start reuses it. Stop it with `taskkill /IM llama-server.exe`.
 - Server output goes to `~/.jarvis/logs/llama-server.log`. If the server exits while loading, the

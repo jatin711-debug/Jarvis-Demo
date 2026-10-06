@@ -35,6 +35,7 @@ _API_OPENAI_CHAT = "/v1/chat/completions"
 _API_HEALTH = "/health"
 _API_PROPS = "/props"
 _LLAMACPP_READY_WAIT_S = 90.0   # a cold model load can take this long; /health answers 503 meanwhile
+_SERVER_EXIT_GRACE_S = 1.0      # a dropped connection can be seen just before the exit is reported
 
 
 class LLMClient:
@@ -57,6 +58,7 @@ class LLMClient:
         self._hf_tokenizer = None
         self._hf_lock = asyncio.Lock()
         self._server: LlamaServer | None = None  # llama-server, when Jarvis started it
+        self._server_lock = asyncio.Lock()  # one restart at a time
         self._server_vision = False  # llama-server: was it started with a multimodal projector?
 
     async def startup(self) -> None:
@@ -81,32 +83,10 @@ class LLMClient:
             except RuntimeError as exc:
                 await self._abort_startup(str(exc))
 
-        loop = asyncio.get_running_loop()
-        wait_s = self.config.server.startup_timeout if self._server else _LLAMACPP_READY_WAIT_S
-        deadline = loop.time() + wait_s
-        announced = False
-        while True:
-            status = await self._llamacpp_status()
-            if status == 200:
-                break
-            if self._server is not None and not self._server.alive():
-                await self._abort_startup(
-                    "llama-server exited during startup. Last output:\n" + self._server.log_tail())
-            if status is None and self._server is None:
-                await self._abort_startup(
-                    f"Cannot reach llama-server at {self.base_url}. Start it first, e.g.: "
-                    "llama-server -m <model.gguf> --port 8080 -ngl 99 -fa on, or set "
-                    "llm.server.model so Jarvis starts it (see docs/llamacpp.md)")
-            if status not in (None, 503):
-                await self._abort_startup(
-                    f"llama-server at {self.base_url} is unhealthy (HTTP {status})")
-            if loop.time() >= deadline:
-                await self._abort_startup(
-                    f"llama-server at {self.base_url} is still loading its model after {wait_s:.0f}s")
-            if not announced:
-                logger.info("waiting for llama-server to load its model url=%s", self.base_url)
-                announced = True
-            await asyncio.sleep(1.0)
+        try:
+            await self._await_llamacpp_ready()
+        except RuntimeError as exc:
+            await self._abort_startup(str(exc))
 
         props = await self._server_props()
         self._server_vision = bool((props.get("modalities") or {}).get("vision"))
@@ -118,6 +98,58 @@ class LLMClient:
             logger.warning("llama-server context (%d) is smaller than llm.context_window (%d); "
                            "start it with -c %d", n_ctx, self.config.context_window,
                            self.config.context_window)
+
+    async def _await_llamacpp_ready(self) -> None:
+        """Wait until /health says the model is loaded; RuntimeError says why it cannot be."""
+        loop = asyncio.get_running_loop()
+        server = self._server
+        wait_s = self.config.server.startup_timeout if server else _LLAMACPP_READY_WAIT_S
+        deadline = loop.time() + wait_s
+        announced = False
+        while True:
+            status = await self._llamacpp_status()
+            if status == 200:
+                return
+            if server is not None and not server.alive():
+                raise RuntimeError(
+                    "llama-server exited during startup. Last output:\n" + server.log_tail())
+            if status is None and server is None:
+                raise RuntimeError(
+                    f"Cannot reach llama-server at {self.base_url}. Start it first, e.g.: "
+                    "llama-server -m <model.gguf> --port 8080 -ngl 99 -fa on, or set "
+                    "llm.server.model so Jarvis starts it (see docs/llamacpp.md)")
+            if status not in (None, 503):
+                raise RuntimeError(f"llama-server at {self.base_url} is unhealthy (HTTP {status})")
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"llama-server at {self.base_url} is still loading its model after {wait_s:.0f}s")
+            if not announced:
+                logger.info("waiting for llama-server to load its model url=%s", self.base_url)
+                announced = True
+            await asyncio.sleep(1.0)
+
+    async def _ensure_llamacpp_server(self) -> None:
+        """Restart a llama-server that Jarvis launched and that has since exited.
+
+        A server somebody else started is never touched: if it goes away, requests fail
+        and the error says so.
+        """
+        server = self._server
+        if server is None or server.alive():
+            return
+        async with self._server_lock:
+            if self._server is not server or server.alive():
+                return  # shut down, or another request already restarted it
+            logger.warning("llama-server exited code=%s; restarting. Last output:\n%s",
+                           server.exit_code, server.log_tail())
+            await server.stop()  # releases the old log handle
+            try:
+                await server.start()
+                await self._await_llamacpp_ready()
+            except RuntimeError:
+                await server.stop()  # a server stuck while loading must not linger
+                raise
+            logger.info("llama-server restarted url=%s", self.base_url)
 
     async def _llamacpp_status(self) -> int | None:
         """HTTP status of llama-server's /health, or None when nothing answers."""
@@ -567,6 +599,38 @@ class LLMClient:
         return converted
 
     async def _stream_llamacpp(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        images: list[str] | None = None,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """``_stream_llamacpp_once`` that survives the server dying.
+
+        A server Jarvis launched is restarted when it is found dead before a request. If it
+        dies while the request is in flight and nothing of the reply has been passed on yet,
+        it is restarted and the request is sent once more. Once part of a reply has gone out
+        it cannot be replayed, so the error is raised and the next request restarts the server.
+        """
+        for attempt in (1, 2):
+            await self._ensure_llamacpp_server()
+            emitted = False
+            try:
+                async with aclosing(self._stream_llamacpp_once(
+                        messages, tools, temperature, max_tokens, images)) as stream:
+                    async for item in stream:
+                        emitted = True
+                        yield item
+                return
+            except httpx.TransportError as exc:
+                if (attempt == 2 or emitted or self._server is None
+                        or isinstance(exc, httpx.TimeoutException)
+                        or not await self._server.wait_exit(_SERVER_EXIT_GRACE_S)):
+                    raise
+                logger.warning("llama-server died during the request; retrying once error=%s", exc)
+
+    async def _stream_llamacpp_once(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,

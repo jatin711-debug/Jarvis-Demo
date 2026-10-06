@@ -96,6 +96,25 @@ class LlamaServer:
     def alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    @property
+    def exit_code(self) -> int | None:
+        """The exit code of a process that has ended, else None."""
+        return self._process.poll() if self._process is not None else None
+
+    async def wait_exit(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the process to end; True when it is not running.
+
+        A dropped connection can be seen a moment before the exit is reported.
+        """
+        process = self._process
+        if process is None:
+            return True
+        try:
+            await asyncio.to_thread(process.wait, timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
     def log_tail(self) -> str:
         """The end of the server's output, for error messages."""
         try:
