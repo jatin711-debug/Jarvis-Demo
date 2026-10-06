@@ -28,6 +28,7 @@ from jarvis.utils.config import expand_path
 from jarvis.utils.logger import begin_turn, end_turn, get_logger
 from jarvis.voice.cues import play_listening_cue, play_wake_cue
 from jarvis.voice.devices import resolve_voice_devices
+from jarvis.voice.speech_text import speakable
 from jarvis.voice.transcript import is_explicit_yes, is_garbage, is_hallucination
 
 if TYPE_CHECKING:
@@ -41,6 +42,8 @@ logger = get_logger(__name__)
 # at the very end of the buffer is not enough: streamed tokens can split "3.5" into
 # "3" and ".5", so the last sentence is flushed when the stream ends instead.
 _SENTENCE_END = re.compile(r"[.!?]\s+|\n")
+# A list item's own number ("2" in "\n2. Open it"), at the end of the text before a ".".
+_LIST_NUMBER = re.compile(r"(?:^|\n)[ \t]*\d{1,2}$")
 
 # After this many empty recordings in a row the session drops back to wake word.
 _MAX_SILENT_FOLLOWUPS = 2
@@ -80,10 +83,11 @@ class _Heard:
 
 def _split_sentence(buffer: str) -> tuple[str, str] | None:
     """Split off the first complete sentence of ``buffer``, if there is one."""
-    match = _SENTENCE_END.search(buffer)
-    if match is None:
-        return None
-    return buffer[:match.end()].strip(), buffer[match.end():]
+    for match in _SENTENCE_END.finditer(buffer):
+        if buffer[match.start()] == "." and _LIST_NUMBER.search(buffer, 0, match.start()):
+            continue  # the "1." that opens a list item is not the end of a sentence
+        return buffer[:match.end()].strip(), buffer[match.end():]
+    return None
 
 
 def _clip(text: str, limit: int = _REPLY_LOG_CHARS) -> str:
@@ -363,6 +367,9 @@ class Orchestrator:
 
     async def _speak_plain(self, text: str) -> None:
         """tts.speak, but a cancelled turn stops playback instead of finishing the sentence."""
+        text = speakable(text)
+        if not text:
+            return
         try:
             await self.tts.speak(text)
         except asyncio.CancelledError:
@@ -397,6 +404,9 @@ class Orchestrator:
         A failing speaker or microphone does not fail the turn: it is logged
         (see _note_fault) and the reply carries on without that part.
         """
+        text = speakable(text)
+        if not text:
+            return False  # nothing but markup, e.g. a "---" divider
         if not self.config.voice.barge_in:
             await self._speak_plain(text)
             return False

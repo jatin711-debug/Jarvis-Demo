@@ -5,7 +5,7 @@ A fully local, voice-enabled AI assistant with intelligent memory, natural speec
 ## Features
 
 - Wake word detection (OpenWakeWord) with echo suppression
-- Streaming responses — sentences are spoken as the LLM generates them
+- Streaming responses — sentences are spoken as the LLM generates them (markdown markup and raw URLs are not read aloud)
 - **Barge-in** — interrupt Jarvis mid-response just by talking
 - ReAct agent with native tool calling (Ollama or llama.cpp) + automatic text-parsing fallback
 - Optional Cua desktop backend and resumable fixture/Calculator acceptance workflows

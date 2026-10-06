@@ -89,6 +89,18 @@ class TestHelpers:
     def test_decimals_and_versions_are_not_sentence_ends(self, text):
         assert _split_sentence(text) is None
 
+    def test_a_list_number_is_not_a_sentence_of_its_own(self):
+        assert _split_sentence("1. Open the file. Then") == ("1. Open the file.", "Then")
+        assert _split_sentence("Steps:\n2. Save it.\n3. Close") == ("Steps:", "2. Save it.\n3. Close")
+        assert _split_sentence("12. Done. ") == ("12. Done.", "")
+        assert _split_sentence("It is 3. Next") == ("It is 3.", "Next")  # a number ending a sentence
+
+    def test_a_streamed_list_is_spoken_item_by_item(self):
+        sentences, leftover = stream_sentences(
+            ["Steps:", "\n1", ". Open", " it.\n", "2", ". Save it", ".\n"])
+        assert sentences == ["Steps:", "1. Open it.", "2. Save it."]
+        assert leftover == ""
+
     def test_decimal_split_across_tokens_is_spoken_whole(self):
         sentences, leftover = stream_sentences(["It is 3", ".", "5 degrees", " out. ", "Bring a coat."])
         assert sentences == ["It is 3.5 degrees out."]
@@ -516,6 +528,21 @@ class TestSpeechOutput:
         monitor.result = True
         assert await app._speak_interruptible("A long sentence.") is True
         app.tts.abort.assert_called_once()
+
+    async def test_markup_is_not_read_aloud(self, app, monitor):
+        await app._speak_interruptible("- **Name:** see [the docs](https://example.com/x).")
+        assert spoken(app) == ["Name: see the docs."]
+
+    async def test_a_sentence_of_only_markup_says_nothing(self, app, monitor):
+        assert await app._speak_interruptible("---") is False
+        app.tts.speak.assert_not_awaited()
+        assert monitor.started == 0
+
+    async def test_markup_is_not_read_aloud_without_barge_in(self):
+        app = make_app(barge_in=False)
+        await app._speak_interruptible("## **Done** — `3` files.")
+        await app._speak_safe("* * *")
+        assert spoken(app) == ["Done — 3 files."]
 
     async def test_finished_speech_stops_the_monitor_and_is_not_an_interruption(self, app, monitor):
         assert await app._speak_interruptible("Short.") is False
