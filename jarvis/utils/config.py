@@ -64,6 +64,10 @@ class LlamaServerConfig(BaseModel):
     mmproj: str | None = None  # multimodal projector for image input; omit for text-only (saves VRAM)
     # Flags between builds change (e.g. --no-mmap became -lm none); these two are stable.
     args: list[str] = Field(default_factory=lambda: ["-ngl", "99", "-fa", "on"])
+    # MiB of host RAM the server may use to keep old prompts for reuse (-cram). llama-server's own
+    # default is 8192, which grew the server from 1 GB to 2.9 GB in 13 requests with no speed gain
+    # for a single conversation. None: do not pass the flag (builds that predate it reject it).
+    cache_ram: int | None = Field(default=0, ge=-1)
     startup_timeout: float = Field(default=120.0, gt=0)
 
 

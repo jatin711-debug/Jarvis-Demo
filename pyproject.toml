@@ -64,6 +64,9 @@ jarvis = "jarvis.__main__:cli"
 [tool.setuptools.packages.find]
 include = ["jarvis*"]
 
+[tool.setuptools.package-data]
+"jarvis.bench" = ["scenarios.yaml"]
+
 # ================================
 # Pytest
 # ================================

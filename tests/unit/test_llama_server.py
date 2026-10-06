@@ -127,6 +127,20 @@ class TestBuildCommand:
         assert tail[tail.index("-np") + 1] == "1"
         assert "--mmproj" not in command
 
+    def test_the_prompt_cache_is_capped_unless_told_otherwise(self, setup):
+        make, _, _ = setup
+
+        def cache_flags(command):
+            return [command[i + 1] for i, word in enumerate(command) if word == "-cram"]
+
+        assert cache_flags(build_command(make())) == ["0"]
+        assert cache_flags(build_command(make(cache_ram=512))) == ["512"]
+        assert cache_flags(build_command(make(cache_ram=None))) == []  # builds that predate the flag
+        for spelling in ("-cram", "--cache-ram"):  # the user's own flag is the only one
+            command = build_command(make(args=[spelling, "2048"]))
+            assert command.count("-cram") + command.count("--cache-ram") == 1
+            assert command[command.index(spelling) + 1] == "2048"
+
     def test_projector_is_added_only_when_configured_and_present(self, setup):
         make, _, tmp_path = setup
         projector = tmp_path / "mmproj.gguf"

@@ -58,6 +58,8 @@ def build_command(config: LLMConfig) -> list[str]:
     # User flags come first so the flags Jarvis depends on (model, address, context) win.
     command = [executable, *server.args, "-m", str(model), "--host", host, "--port", str(port),
                "-c", str(config.context_window), "-np", "1", "--alias", config.model]
+    if server.cache_ram is not None and not {"-cram", "--cache-ram"} & set(server.args):
+        command += ["-cram", str(server.cache_ram)]  # a -cram written in args is the user's choice
     if server.mmproj:
         projector = expand_path(server.mmproj)
         if not projector.is_file():
@@ -95,6 +97,10 @@ class LlamaServer:
 
     def alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process is not None else None
 
     @property
     def exit_code(self) -> int | None:

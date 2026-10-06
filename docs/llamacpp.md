@@ -74,7 +74,8 @@ each including Python start-up. That is too small a sample to rank them; per Qwe
 |---|---|
 | `-ngl 99` | every layer on the GPU |
 | `-fa on` | flash attention: less memory, faster |
-| `-lm none` (older builds: `--no-mmap`) | the model is not kept in RAM after it is copied to the GPU: the server's resident memory dropped from 3.1 GB to about 1 GB. Flag names change between builds; `llama-server --help` is the authority |
+| `-lm none` (older builds: `--no-mmap`) | the model is not kept in RAM after it is copied to the GPU: an idle server's resident memory dropped from 3.1 GB to about 1 GB. Flag names change between builds; `llama-server --help` is the authority |
+| `-cram N` | set from `llm.server.cache_ram` (default 0) by Jarvis. The server keeps old prompts in host RAM for reuse, up to 8 GB by default: it grew from 1 GB to 2.9 GB over the 13 [benchmark](bench.md) scenarios and would keep going. With 0 it stayed at 1.4 GB, and the median reply time did not change (2.3 s). Put `-cram` in `args` to choose your own, or set `cache_ram: null` for a build that rejects the flag |
 | `-c` | set from `llm.context_window` by Jarvis. A model that fits comfortably at 4096 leaves room to raise it |
 
 ## Behavior to know

@@ -61,6 +61,11 @@ class LLMClient:
         self._server_lock = asyncio.Lock()  # one restart at a time
         self._server_vision = False  # llama-server: was it started with a multimodal projector?
 
+    @property
+    def server_pid(self) -> int | None:
+        """Process id of the llama-server Jarvis launched, or None (not launched by Jarvis)."""
+        return self._server.pid if self._server is not None else None
+
     async def startup(self) -> None:
         """Initialize the LLM client based on provider."""
         if self.provider == "huggingface":

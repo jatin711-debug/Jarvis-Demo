@@ -57,6 +57,7 @@ CPU) and Jarvis can start and stop `llama-server` for you.
 wider permissions) in an untracked `config.local.yaml` that starts with
 `extends: config.yaml`; it is picked up automatically. Pick another file with
 `--config PATH` or `JARVIS_CONFIG`. See [security profiles](docs/security.md#profiles).
+Compare models or catch regressions with `python -m jarvis.bench` ([scenario benchmark](docs/bench.md)).
 Notable options: `voice.barge_in`, `system.latency_report`, `voice.tts.engine` (`kokoro` or `piper`).
 `voice.input_device` / `voice.output_device` take an index or a device name such as `"JBL"`;
 a name keeps working when a headset reconnects and indexes shift, and falls back to the system
@@ -106,7 +107,7 @@ The unit suite mocks the LLM and needs no microphone, Ollama, or models.
 The scripts in `tests/manual/` exercise specific live services. The Cua smoke
 needs an interactive Windows desktop but no model or voice devices. See
 [durable task commands](docs/tasks.md), [current permission behavior](docs/security.md),
-[how to read the logs](docs/logging.md), the [tool inventory](docs/tools.md)
+[how to read the logs](docs/logging.md), the [scenario benchmark](docs/bench.md), the [tool inventory](docs/tools.md)
 (`jarvis --list-tools`), and the [roadmap](docs/roadmap.md).
 
 CI runs pytest + ruff on every push (see `.github/workflows/ci.yml`).
