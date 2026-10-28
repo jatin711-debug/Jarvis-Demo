@@ -265,6 +265,9 @@ class PermissionGateway:
                     raise ValueError("Process termination requires an exact numeric PID")
             elif name.startswith("desktop_") and name not in {"desktop_windows", "desktop_launch"}:
                 target = f"pid={args.get('pid')}, window_id={args.get('window_id')}"
+                control = args.get("label") or args.get("index")
+                if control not in (None, ""):
+                    target += f", control {control}"  # what the user is asked to approve
             elif name.startswith("browser_") and self.security.allowed_hosts is not None:
                 # Active-page actions need a persisted URL handoff before a
                 # host allowlist can be enforced. Fail closed for now.

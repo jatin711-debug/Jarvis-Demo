@@ -197,6 +197,19 @@ def test_voice_approval_requires_exact_yes(heard, approved):
     assert is_explicit_yes(heard) is approved
 
 
+def test_desktop_approval_names_the_control(tmp_path):
+    gateway = policy(tmp_path)
+    by_label = gateway.inspect("desktop_click", {"pid": 4, "window_id": 9, "label": "Delete"})
+    assert by_label.allowed and by_label.requires_confirmation
+    assert by_label.target == "pid=4, window_id=9, control Delete"
+    assert gateway.inspect("desktop_key", {"pid": 4, "window_id": 9, "index": 3, "key": "tab"}
+                           ).target.endswith("control 3")
+    assert gateway.inspect("desktop_observe", {"pid": 4, "window_id": 9}).target == "pid=4, window_id=9"
+    # A different control is a different action, so an approval cannot be reused for it.
+    other = gateway.inspect("desktop_click", {"pid": 4, "window_id": 9, "label": "Save"})
+    assert other.action_id != by_label.action_id
+
+
 def test_all_builtin_tools_have_permission_classification():
     system = ToolRegistry()
     browser = ToolRegistry()

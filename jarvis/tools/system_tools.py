@@ -124,13 +124,12 @@ def register_system_tools(
         try:
             validate_command(security, command)
         except ValueError as refusal:
-            logger.warning("command blocked command=%r reason=%s", command, refusal)
+            logger.warning("command blocked reason=policy")
             return str(refusal)
         try:
             code, stdout, stderr = await _run_shell(command, _COMMAND_TIMEOUT_S)
         except TimeoutError:
-            logger.warning("command stopped after timeout=%gs command=%r",
-                           _COMMAND_TIMEOUT_S, command)
+            logger.warning("command stopped after timeout=%gs", _COMMAND_TIMEOUT_S)
             return f"Command timed out after {_COMMAND_TIMEOUT_S:g} seconds and was stopped."
         except Exception as e:
             return f"Error: {e}"

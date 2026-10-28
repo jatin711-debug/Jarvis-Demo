@@ -366,6 +366,12 @@ class LLMClient:
         logger.debug("llm response chars=%d", len(result.get("message", {}).get("content", "")))
         return result
 
+    def _thinking_mode(self) -> bool | None:
+        """An explicit setting wins over the backwards-compatible Qwen3.5 default."""
+        if self.config.enable_thinking is not None:
+            return self.config.enable_thinking
+        return False if "qwen3.5" in self.config.model.lower() else None
+
     def _ollama_payload(
         self,
         messages: list[dict[str, str]],
@@ -397,9 +403,9 @@ class LLMClient:
                 "num_ctx": self.config.context_window,
             },
         }
-        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
-        if "qwen3.5" in self.config.model.lower():
-            payload["think"] = False
+        thinking = self._thinking_mode()
+        if thinking is not None:
+            payload["think"] = thinking
         if tools:
             payload["tools"] = tools
         return payload
@@ -550,9 +556,9 @@ class LLMClient:
             "top_p": self.config.top_p,
             "max_tokens": max_tokens or self.config.max_tokens,
         }
-        # Disable thinking mode for Qwen3.5 (prevents reasoning token overhead)
-        if "qwen3.5" in self.config.model.lower():
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        thinking = self._thinking_mode()
+        if thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": thinking}
         if tools:
             payload["tools"] = tools
         return payload

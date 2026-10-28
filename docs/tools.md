@@ -71,9 +71,9 @@ Offered for window and app tasks when `desktop.backend: cua`.
 
 | Tool | Effect | Confirms | What it does |
 |---|---|---|---|
-| `desktop_click` | local edit | yes | Click an observed element |
-| `desktop_key` | local edit | yes | Press a key (return, tab, escape, etc.) in an observed control |
-| `desktop_launch` | control | yes | Launch a desktop app by name, then list windows |
-| `desktop_observe` | read | no | Read current controls and values of an exact window |
-| `desktop_type` | local edit | yes | Set the text of an observed editable element; may replace its existing value |
+| `desktop_click` | local edit | yes | Click a control of an observed window by its label |
+| `desktop_key` | local edit | yes | Press a key (return, tab, escape, etc.) in a control found by its label |
+| `desktop_launch` | control | yes | Launch a desktop app by name; returns its windows (pid and window_id) |
+| `desktop_observe` | read | no | List the controls of an exact window: index, role, label and value |
+| `desktop_type` | local edit | yes | Set the text of an editable control, found by its label; may replace its existing value |
 | `desktop_windows` | read | no | List app windows; use returned pid/window_id only |

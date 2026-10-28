@@ -190,8 +190,7 @@ class ToolRegistry:
         if error:
             allowed = list(tool.parameters.get("properties", {}))
             required = tool.parameters.get("required", [])
-            logger.warning("tool rejected name=%s error=%s allowed=%s required=%s",
-                           tool_name, error, allowed, required)
+            logger.warning("tool rejected name=%s reason=invalid_arguments", tool_name)
             return (f"Invalid arguments for {tool_name}: {error}. "
                     f"Allowed parameter names: {allowed}. Required parameter names: {required}. "
                     "Unknown parameters must be removed, not supplied. No action was executed.")
@@ -200,7 +199,7 @@ class ToolRegistry:
             decision = self._permission_gateway.inspect(
                 tool_name, kwargs, tool_requires_confirmation=tool.requires_confirmation)
             if not decision.allowed:
-                logger.warning("tool denied name=%s reason=%s", tool_name, decision.reason)
+                logger.warning("tool denied name=%s reason=policy", tool_name)
                 return f"{PERMISSION_DENIED_PREFIX} {decision.reason}. No action was executed."
             if decision.requires_confirmation:
                 if self._confirm_callback is None:
@@ -229,7 +228,7 @@ class ToolRegistry:
         try:
             return await tool.handler(**kwargs)
         except Exception as e:
-            logger.debug("tool handler raised name=%s error=%s", tool_name, e)
+            logger.debug("tool handler raised name=%s error_type=%s", tool_name, type(e).__name__)
             raise
 
     def get_ollama_tools(self) -> list[dict[str, Any]]:

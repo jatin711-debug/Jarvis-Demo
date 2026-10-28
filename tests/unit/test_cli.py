@@ -1,5 +1,6 @@
 """Entry point: config errors, exit codes, text mode, and clean shutdown."""
 
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -93,6 +94,27 @@ async def test_verbose_puts_debug_on_the_console(config_file, monkeypatch):
     await cli.main(["--config", str(config_file), "--text", "hi", "-v"])
     console = next(h for h in logging.getLogger().handlers if type(h) is logging.StreamHandler)
     assert console.level == logging.DEBUG
+
+
+async def test_configured_json_format_is_used_for_file_logs(config_file, monkeypatch, tmp_path):
+    with config_file.open("a", encoding="utf-8") as config:
+        config.write("  log_format: json\n")
+    install_fake(monkeypatch)
+    assert await cli.main(["--config", str(config_file), "--text", "hi"]) == cli.EXIT_OK
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    events = [json.loads(line) for line in (tmp_path / "logs" / "jarvis.log").read_text(
+        encoding="utf-8").splitlines()]
+    assert any(event["message"].startswith("starting jarvis") for event in events)
+    assert all(event["run_id"] == events[0]["run_id"] for event in events)
+
+
+async def test_invalid_log_format_is_a_configuration_error(config_file, monkeypatch):
+    with config_file.open("a", encoding="utf-8") as config:
+        config.write("  log_format: xml\n")
+    fake = install_fake(monkeypatch)
+    assert await cli.main(["--config", str(config_file), "--text", "hi"]) == cli.EXIT_BAD_CONFIG
+    fake.startup.assert_not_called()
 
 
 async def test_list_tools_prints_the_inventory_without_starting_services(config_file, monkeypatch, capsys):

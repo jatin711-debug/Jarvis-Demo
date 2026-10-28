@@ -4,9 +4,10 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
-from jarvis.agent.react_agent import MAX_ITERATIONS, ReActAgent
+from jarvis.agent.react_agent import MAX_DESKTOP_TOOL_CALLS, MAX_ITERATIONS, ReActAgent
 from jarvis.agent.routing import Route, Surface
 from jarvis.agent.tool_registry import ToolRegistry
 
@@ -155,26 +156,83 @@ class TestIterationLimit:
         assert len(record) == MAX_ITERATIONS
 
 
+class TestRunawayGuards:
+    async def test_a_model_replaying_clicks_is_stopped_even_within_one_reply(self):
+        record = []
+        desktop = ToolRegistry()
+
+        @desktop.tool("desktop_click", "Click", {"type": "object", "properties": {}}, repeatable=True)
+        async def desktop_click():
+            record.append("click")
+            return "clicked"
+
+        # One reply carrying 40 identical calls: no iteration limit would catch this.
+        llm = ScriptedLLM([{"content": "", "tool_calls": [
+            {"function": {"name": "desktop_click", "arguments": {}}} for _ in range(40)]}])
+        agent = ReActAgent(llm, ToolRegistry(), "sys", desktop_tools=desktop)
+        answer = await agent.run("Click in the calculator window")
+        assert len(record) == MAX_DESKTOP_TOOL_CALLS
+        assert f"stopped after {MAX_DESKTOP_TOOL_CALLS} actions" in answer
+
+    async def test_a_conversation_that_outgrew_the_context_ends_with_a_plain_message(self, monkeypatch):
+        monkeypatch.setattr("jarvis.agent.react_agent.asyncio.sleep", AsyncMock())
+        request = httpx.Request("POST", "http://127.0.0.1:8080/v1/chat/completions")
+        error = httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(
+            400, request=request, text='{"error":{"message":"request (4491 tokens) exceeds the '
+                                       'available context size (4096 tokens), try increasing it"}}'))
+        llm = SimpleNamespace(provider="llamacpp", chat=AsyncMock(side_effect=[error] * 3))
+        answer = await ReActAgent(llm, make_tools(), "sys").run("What time is it?")
+        assert "too long" in answer and "stopped" in answer
+
+    async def test_other_bad_requests_still_raise(self, monkeypatch):
+        monkeypatch.setattr("jarvis.agent.react_agent.asyncio.sleep", AsyncMock())
+        request = httpx.Request("POST", "http://127.0.0.1:8080/v1/chat/completions")
+        error = httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(
+            400, request=request, text='{"error":{"message":"invalid grammar"}}'))
+        llm = SimpleNamespace(provider="llamacpp", chat=AsyncMock(side_effect=[error] * 3))
+        with pytest.raises(httpx.HTTPStatusError):
+            await ReActAgent(llm, make_tools(), "sys").run("What time is it?")
+
+
+class TestDesktopErrorHint:
+    async def test_a_rejected_desktop_call_says_where_ids_and_labels_come_from(self):
+        desktop = ToolRegistry()
+
+        @desktop.tool("desktop_click", "Click", {"type": "object", "properties": {
+            "label": {"type": "string"}}})
+        async def desktop_click(label=None):
+            raise ValueError('No enabled control is labeled "7"')
+
+        llm = ScriptedLLM([call("desktop_click", label="7"), {"content": "Sorry."}])
+        agent = ReActAgent(llm, ToolRegistry(), "sys", desktop_tools=desktop)
+        await agent.run("Click 7 in the calculator window")
+        fed_back = str(llm.requests[1]["messages"])
+        assert 'No enabled control is labeled' in fed_back
+        assert "control labels come from desktop_observe" in fed_back
+
+
 class TestToolLogging:
-    async def test_call_and_outcome_are_logged_with_secrets_redacted(self, caplog):
+    async def test_call_and_outcome_are_logged_without_argument_values(self, caplog):
         tools = ToolRegistry()
 
         @tools.tool("get_datetime", "Get date and time", {"type": "object", "properties": {
-            "password": {"type": "string"}}})
-        async def get_datetime(password=""):
+            "password": {"type": "string"}, "text": {"type": "string"}}})
+        async def get_datetime(password="", text=""):
             return "5pm"
 
-        llm = ScriptedLLM([call("get_datetime", password="hunter2"), {"content": "It is 5pm."}])
+        llm = ScriptedLLM([call("get_datetime", password="hunter2", text="private words"),
+                           {"content": "It is 5pm."}])
         agent = ReActAgent(llm, tools, "sys")
         with caplog.at_level(logging.INFO, logger="jarvis.agent.react_agent"):
             await agent.run("What time is it?")
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "route surface=system groups=clock" in text
-        assert "tool call name=get_datetime args={password=<redacted>}" in text
+        assert "tool call name=get_datetime args_count=2" in text
         assert "hunter2" not in text
+        assert "private words" not in text
         assert "tool ok name=get_datetime" in text
 
-    async def test_failures_are_logged_as_warnings_with_detail(self, caplog):
+    async def test_failures_are_logged_as_warnings_without_result_content(self, caplog):
         tools = ToolRegistry()
 
         @tools.tool("get_datetime", "Get date and time", {"type": "object", "properties": {}})
@@ -187,7 +245,7 @@ class TestToolLogging:
             await agent.run("What time is it?")
         warning = next(r for r in caplog.records if r.getMessage().startswith("tool error"))
         assert warning.levelno == logging.WARNING
-        assert "clock unavailable" in warning.getMessage()
+        assert "clock unavailable" not in caplog.text
 
 
 class TestErrorHints:

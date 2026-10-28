@@ -1,10 +1,10 @@
 """Console and file log lines are plain, aligned, and tagged with the turn."""
 
+import json
 import logging
 
 import pytest
 
-from jarvis.agent.react_agent import _brief_args
 from jarvis.utils.logger import (
     ConsoleFormatter,
     FileFormatter,
@@ -106,9 +106,27 @@ def test_setup_logging_writes_debug_to_file_but_info_to_console(tmp_path, capsys
     assert "debug-only detail" in written and "visible event" in written
 
 
-def test_tool_arguments_are_redacted_and_shortened_in_logs():
-    shown = _brief_args({"password": "hunter2", "api_key": "abc", "text": "x" * 500, "n": 3})
-    assert "hunter2" not in shown and "abc" not in shown
-    assert "password=<redacted>" in shown and "api_key=<redacted>" in shown
-    assert len(shown) < 200
-    assert "n=3" in shown
+def test_json_file_events_have_run_and_turn_context_and_one_line_per_event(tmp_path):
+    setup_logging(log_dir=str(tmp_path), file_format="json")
+    turn = begin_turn()
+    log = logging.getLogger("jarvis.test")
+    log.info("first\nsecond")
+    try:
+        raise ValueError("failure")
+    except ValueError:
+        log.exception("failed")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    events = [json.loads(line) for line in (tmp_path / "jarvis.log").read_text(
+        encoding="utf-8").splitlines()]
+    assert len(events) == 2
+    assert events[0]["message"] == "first\nsecond"
+    assert events[0]["turn"] == f"t{turn}"
+    assert events[0]["run_id"] == events[1]["run_id"]
+    assert events[0]["timestamp"].endswith("+00:00")
+    assert "ValueError: failure" in events[1]["exception"]
+
+
+def test_rejects_unknown_file_format(tmp_path):
+    with pytest.raises(ValueError, match="file_format"):
+        setup_logging(log_dir=str(tmp_path), file_format="xml")

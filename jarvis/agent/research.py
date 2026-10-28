@@ -43,7 +43,7 @@ async def run_research(
     Search, read promising pages, then synthesize; stops after ``max_sources``
     pages and never repeats an identical tool call.
     """
-    logger.info("research started query=%r max_sources=%d", query[:80], max_sources)
+    logger.info("research started query_chars=%d max_sources=%d", len(query), max_sources)
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _SYSTEM_PROMPT},

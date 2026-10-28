@@ -2,6 +2,7 @@
 
 No desktop actions: the only callable tool is a deterministic test fixture.
 """
+import argparse
 import asyncio
 import time
 
@@ -11,8 +12,8 @@ from jarvis.agent.tool_registry import ToolRegistry
 from jarvis.utils.config import load_config
 
 
-async def main():
-    config = load_config("config.lfm.yaml")
+async def main(config_path):
+    config = load_config(config_path)
     client = LLMClient(config.llm)
     registry = ToolRegistry()
     calls = []
@@ -45,4 +46,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Run a real LFM model smoke test")
+    parser.add_argument("--config", required=True, help="Path to an LFM configuration")
+    asyncio.run(main(parser.parse_args().config))

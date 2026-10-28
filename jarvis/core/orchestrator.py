@@ -28,6 +28,7 @@ from jarvis.utils.config import expand_path
 from jarvis.utils.logger import begin_turn, end_turn, get_logger
 from jarvis.voice.cues import play_listening_cue, play_wake_cue
 from jarvis.voice.devices import resolve_voice_devices
+from jarvis.voice.search_monitor import monitor_search
 from jarvis.voice.speech_text import speakable
 from jarvis.voice.transcript import is_explicit_yes, is_garbage, is_hallucination
 
@@ -66,8 +67,6 @@ _DISMISS_PHRASES = frozenset({
     "nothing else", "im good", "all done", "done",
 })
 
-_REPLY_LOG_CHARS = 300
-
 # Recorded after a reply the user talked over, so the next turn knows it was cut short.
 _INTERRUPTED_NOTE = " [interrupted by the user]"
 
@@ -88,11 +87,6 @@ def _split_sentence(buffer: str) -> tuple[str, str] | None:
             continue  # the "1." that opens a list item is not the end of a sentence
         return buffer[:match.end()].strip(), buffer[match.end():]
     return None
-
-
-def _clip(text: str, limit: int = _REPLY_LOG_CHARS) -> str:
-    text = " ".join(text.split())
-    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _describe(error: BaseException) -> str:
@@ -254,14 +248,14 @@ class Orchestrator:
         agent = self._require_agent()
         begin_turn()
         try:
-            logger.info("heard text=%r", text)
+            logger.info("heard chars=%d", len(text))
             context = await self._get_memory_context(text)
             response = await agent.run(
                 user_message=text,
                 conversation_history=self._conversation_history,
                 context=context,
             )
-            logger.info("reply text=%r", _clip(response))
+            logger.info("reply chars=%d", len(response))
             self._remember_exchange(text, response)
             return response
         finally:
@@ -292,6 +286,8 @@ class Orchestrator:
                 speak_s += time.monotonic() - started
 
         self.wake_word.suppress()
+        if self.config.voice.barge_in:
+            agent.search_monitor = self._monitor_voice_search
         try:
             # Closing the stream on barge-in stops the model and, because the agent
             # only advances when asked for the next token, any further tool calls.
@@ -318,6 +314,7 @@ class Orchestrator:
             if leftover and not interrupted:
                 interrupted = await speak(leftover)
         finally:
+            agent.search_monitor = None
             self.wake_word.unsuppress(cooldown=0.5)
 
         if self.config.system.latency_report:
@@ -342,11 +339,28 @@ class Orchestrator:
             "role": "assistant",
             "content": response.rstrip() + _INTERRUPTED_NOTE if interrupted else response})
         limit = self.config.memory.max_conversation_turns * 2
-        if len(self._conversation_history) > limit:
+        if limit == 0:
+            self._conversation_history.clear()
+        elif len(self._conversation_history) > limit:
             self._conversation_history = self._conversation_history[-limit:]
         self._save_conversation(user_text, response)
 
     # ── Speech output ───────────────────────────────────────
+
+    async def _monitor_voice_search(self, operation):
+        """Run one search while listening; never dispatch a second action concurrently."""
+
+        async def confirmation() -> str | None:
+            heard = await self._record_and_transcribe()
+            return heard.text if heard else None
+
+        return await monitor_search(
+            operation,
+            input_device=self._voice.input_device,
+            speak=self._speak_plain,
+            record_confirmation=confirmation,
+            note_fault=self._note_fault,
+        )
 
     def _note_fault(self, component: str, error: Exception) -> None:
         """Log an audio failure: WARNING the first time, DEBUG while the same error repeats."""
@@ -474,7 +488,7 @@ class Orchestrator:
             return False
 
         approved = is_explicit_yes(heard)
-        logger.info("confirmation tool=%s heard=%r approved=%s", tool_name, heard, approved)
+        logger.info("confirmation tool=%s approved=%s", tool_name, approved)
         if not approved:
             await self._speak_safe("Cancelled.")
         return approved
@@ -518,7 +532,7 @@ class Orchestrator:
             logger.debug("transcript ignored reason=empty record=%.2fs stt=%.2fs", record_s, stt_s)
             return None
         if is_hallucination(text, audio_bytes) or is_garbage(text):
-            logger.info("transcript ignored reason=noise text=%r", text)
+            logger.info("transcript ignored reason=noise chars=%d", len(text))
             return None
         return _Heard(text=text, record_s=record_s, stt_s=stt_s)
 
@@ -553,7 +567,7 @@ class Orchestrator:
 
     async def _run_spoken_turn(self, heard: _Heard) -> bool:
         """Handle one accepted utterance. Returns True when the session should end."""
-        logger.info("heard text=%r", heard.text)
+        logger.info("heard chars=%d", len(heard.text))
         phrase = re.sub(r"[^\w\s']", "", heard.text.lower()).strip()
 
         if phrase in _EXIT_PHRASES:
@@ -574,7 +588,7 @@ class Orchestrator:
             response = "Sorry, something went wrong while processing your request."
             await self._speak_safe(response)
 
-        logger.info("reply text=%r", _clip(response))
+        logger.info("reply chars=%d", len(response))
         await play_listening_cue(self._voice.output_device)
         return False
 

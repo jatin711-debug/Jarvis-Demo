@@ -3,13 +3,14 @@
 Jarvis now has a text entry point for ordinary requests:
 
 ```powershell
-python -m jarvis --config config.lfm.yaml --text "How are you doing?"
+python -m jarvis --text "How are you doing?"
 ```
 
 It starts the configured LLM and tools but does not load microphone, wake word,
-STT, or TTS. Dangerous tools require an exact `yes` in an interactive terminal;
-they are denied if stdin is redirected. This one-shot agent turn is not yet a
-resumable task. The persistent task command below is a separate first workflow.
+STT, or TTS. When confirmations are enabled, dangerous tools require an exact
+`yes` in an interactive terminal; they are denied if stdin is redirected. This
+one-shot agent turn is not yet a resumable task. The persistent task command below
+is a separate first workflow.
 
 `python -m jarvis.tasks` manages records in `~/.jarvis/tasks.sqlite3` by default.
 Use `--db PATH` to direct it to a test database. Its commands are `list`,

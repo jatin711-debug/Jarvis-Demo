@@ -127,14 +127,17 @@ class TestShippedProfiles:
         """A config that omits a security key must not be wider than config.yaml."""
         assert SecurityConfig() == load_config(self.ROOT / "config.yaml").security
 
-    def test_lfm_profile_loads(self):
-        assert load_config(self.ROOT / "config.lfm.yaml").llm.provider == "huggingface"
+    def test_bonsai_profile_loads(self):
+        cfg = load_config(self.ROOT / "config.bonsai.yaml")
+        assert cfg.llm.provider == "llamacpp"
+        assert cfg.llm.model == "ternary-bonsai-2-4b"
+        assert cfg.llm.server.mmproj is not None
 
-    def test_lfm_profile_inherits_the_safe_defaults_and_no_machine_settings(self):
+    def test_bonsai_profile_inherits_the_safe_defaults_and_no_machine_settings(self):
         base = load_config(self.ROOT / "config.yaml")
-        lfm = load_config(self.ROOT / "config.lfm.yaml")
-        assert lfm.security == base.security
-        assert lfm.voice == base.voice
-        assert lfm.voice.input_device is None, "device indexes belong in config.local.yaml"
-        assert lfm.memory.enabled is False
-        assert lfm.llm.model != base.llm.model
+        bonsai = load_config(self.ROOT / "config.bonsai.yaml")
+        assert bonsai.security == base.security
+        assert bonsai.voice == base.voice
+        assert bonsai.voice.input_device is None, "device indexes belong in config.local.yaml"
+        assert bonsai.memory.enabled is False
+        assert bonsai.llm.model != base.llm.model

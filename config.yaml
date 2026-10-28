@@ -20,6 +20,7 @@ system:
   name: "Jarvis"
   log_level: "INFO"            # console level: DEBUG, INFO, WARNING, ERROR (the log file always records DEBUG)
   log_dir: "~/.jarvis/logs"
+  log_format: "text"  # Set to "json" for newline-delimited structured file logs.
   data_dir: "~/.jarvis"
   latency_report: true         # one "latency ..." line per spoken turn
 

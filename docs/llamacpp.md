@@ -49,6 +49,41 @@ each including Python start-up. That is too small a sample to rank them; per Qwe
    python -m jarvis -v
    ```
 
+## Faster replies with MTP
+
+Qwen3.5 GGUFs from Unsloth's [`Qwen3.5-4B-MTP-GGUF`](https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF)
+carry a small multi-token-prediction head. The server uses it to draft a few tokens ahead and
+check them in one pass (speculative decoding), so replies come out faster with the same model:
+
+```yaml
+llm:
+  server:
+    model: "D:/llm-models/Qwen3.5-4B-MTP-Q4_K_M.gguf"   # the repo's Qwen3.5-4B-Q4_K_M.gguf, 2.83 GB
+    args: ["-ngl", "99", "-fa", "on", "-lm", "none", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
+```
+
+Needs a llama.cpp build that has `--spec-type draft-mtp` (merged in May 2026; check
+`llama-server --help`). Measured on the reference machine (RTX 3050 Laptop), same Jarvis sampling
+(thinking off, temperature 0.1), median of 3 runs:
+
+| Draft tokens (`--spec-draft-n-max`) | Explanation | Facts | Code | Tool call |
+|---|---|---|---|---|
+| off (the plain Q4_K_M) | 29.6 tok/s | 29.3 | 29.8 | 29.6 |
+| **2** | **35.8** | **35.6** | **45.4** | **45.2** |
+| 3 | 26.9 | 32.3 | 44.7 | 48.8 |
+| 4 | 24.0 | 30.6 | 45.7 | 48.1 |
+
+- Keep it at **2**: it is the only setting never slower than no MTP. At 3 or 4 prose replies get
+  slower than the baseline (fewer drafts are accepted) while tool calls and code gain a little more.
+- The [benchmark](bench.md), 13 scenarios x 3 runs, passed 39/39 both ways. Median reply time went
+  from 2.3 s to 1.8 s and p95 from 5.7 s to 4.3 s (a second baseline run gave 2.3 s and 5.2 s, so
+  it is not drift). The first words arrive at the same time; only the generation after them speeds up.
+- Cost: about 270 MiB more VRAM (2.9 to 3.2 GB in use) and 110 MB more RAM.
+- **`--mmproj` does not work with MTP**, and neither does `-np` above 1 (Jarvis uses 1). Without
+  a projector the model cannot read images: desktop control through Cua is not affected (it reads
+  accessibility trees, not screenshots), but screenshot questions and the PDF/image tools are. To
+  use them, switch back to the plain Q4_K_M, drop the two `--spec-*` flags, and set `mmproj`.
+
 ## How the server is managed
 
 - If `llm.server.model` is set and nothing answers at `llm.base_url`, Jarvis starts `llama-server`
@@ -76,7 +111,7 @@ each including Python start-up. That is too small a sample to rank them; per Qwe
 | `-fa on` | flash attention: less memory, faster |
 | `-lm none` (older builds: `--no-mmap`) | the model is not kept in RAM after it is copied to the GPU: an idle server's resident memory dropped from 3.1 GB to about 1 GB. Flag names change between builds; `llama-server --help` is the authority |
 | `-cram N` | set from `llm.server.cache_ram` (default 0) by Jarvis. The server keeps old prompts in host RAM for reuse, up to 8 GB by default: it grew from 1 GB to 2.9 GB over the 13 [benchmark](bench.md) scenarios and would keep going. With 0 it stayed at 1.4 GB, and the median reply time did not change (2.3 s). Put `-cram` in `args` to choose your own, or set `cache_ram: null` for a build that rejects the flag |
-| `-c` | set from `llm.context_window` by Jarvis. A model that fits comfortably at 4096 leaves room to raise it |
+| `-c` | set from `llm.context_window` by Jarvis (8192 in `config.llamacpp.yaml`). Controlling an app adds about 400 tokens per step and 4096 ran out after three observations; Qwen3.5 keeps a cache for only 8 of its 32 layers, so 8192 costs about 150 MiB more VRAM than 4096 for the 4B (3.2 to 3.4 GB in use with MTP) |
 
 ## Behavior to know
 

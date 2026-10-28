@@ -39,7 +39,7 @@ def is_hallucination(text: str, audio_bytes: bytes) -> bool:
     except Exception:
         return False
     if rms < _SILENCE_RMS:
-        logger.debug("filtered hallucination text=%r rms=%.0f", text, rms)
+        logger.debug("filtered hallucination chars=%d rms=%.0f", len(text), rms)
         return True
     return False
 
@@ -50,9 +50,13 @@ def is_garbage(text: str) -> bool:
     if not stripped:
         return True
 
+    # Whisper sometimes returns only dots or punctuation for silence.
+    if not any(char.isalnum() for char in stripped):
+        return True
+
     # Heavy repetition / stuttering (e.g. "oh. oh. oh.")
     if _GIBBERISH_RE.search(stripped):
-        logger.debug("filtered garbage text=%r reason=repetition", text)
+        logger.debug("filtered garbage chars=%d reason=repetition", len(text))
         return True
 
     # No length filtering: short commands like "open notepad" are legitimate.

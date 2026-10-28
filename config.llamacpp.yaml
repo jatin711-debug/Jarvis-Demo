@@ -16,7 +16,8 @@ llm:
   provider: llamacpp
   model: qwen3.5-4b                  # a label: llama-server serves the GGUF it was started with
   base_url: "http://127.0.0.1:8080"
-  context_window: 4096               # becomes llama-server's -c when Jarvis starts it
+  context_window: 8192               # becomes llama-server's -c when Jarvis starts it; a desktop task adds
+                                     # ~400 tokens a step and 4096 ran out (+150 MiB VRAM for the 4B at 8192)
 
 memory:
   enabled: false                     # Mem0 still extracts and embeds through Ollama

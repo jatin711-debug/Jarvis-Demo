@@ -159,6 +159,15 @@ class TestRequestBody:
         assert self.payload([], model="Qwen3.5-4B")["chat_template_kwargs"] == {"enable_thinking": False}
         assert "chat_template_kwargs" not in self.payload([], model="lfm2.5-1.2b")
 
+    @pytest.mark.parametrize("model,enabled", [
+        ("ternary-bonsai-2-9b", False),
+        ("Qwen3.5-4B", True),
+    ])
+    def test_explicit_thinking_setting_overrides_model_name(self, model, enabled):
+        client = LLMClient(LLMConfig(provider="llamacpp", model=model, enable_thinking=enabled))
+        payload = client._openai_payload([], None, None, None, None)
+        assert payload["chat_template_kwargs"] == {"enable_thinking": enabled}
+
     def test_tools_are_forwarded_only_when_given(self):
         tools = [{"type": "function", "function": {"name": "x"}}]
         assert self.payload([], tools=tools)["tools"] == tools

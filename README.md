@@ -1,6 +1,8 @@
 # JARVIS - Local AI Voice Assistant
 
-A fully local, voice-enabled AI assistant with intelligent memory, natural speech interaction, and system control.
+A local-first, voice-enabled AI assistant with memory, speech interaction, and system control.
+Models and inference run locally with the supplied profiles. Browser searches, initial model
+downloads, and any configured external services require network access.
 
 ## Features
 
@@ -8,7 +10,7 @@ A fully local, voice-enabled AI assistant with intelligent memory, natural speec
 - Streaming responses — sentences are spoken as the LLM generates them (markdown markup and raw URLs are not read aloud)
 - **Barge-in** — interrupt Jarvis mid-response just by talking
 - ReAct agent with native tool calling (Ollama or llama.cpp) + automatic text-parsing fallback
-- Optional Cua desktop backend and resumable fixture/Calculator acceptance workflows
+- Cua desktop backend and separate resumable fixture/Calculator acceptance workflows
 - ~40 tools: shell, files, apps, windows, clipboard, browser (Playwright), vision, scheduler, web search
 - Long-term memory (Mem0 + ChromaDB), 100% local embeddings
 - Per-turn latency report (record / STT / memory / LLM / TTS timings)
@@ -17,19 +19,21 @@ A fully local, voice-enabled AI assistant with intelligent memory, natural speec
 ## Quick Start
 
 ### Prerequisites
-- Python 3.11+
+- Windows and Python 3.11+ (the Cua desktop backend is tested on Windows)
 - [Ollama](https://ollama.com/) installed and running
-- A microphone and speakers
+- A microphone and speakers for voice mode
 
 ### Setup
 
-```bash
+```powershell
 # 1. Create virtual environment
 python -m venv .venv
 .venv\Scripts\activate  # Windows
 
 # 2. Install the project (dependencies are declared in pyproject.toml)
 pip install -r requirements.txt
+# The default config selects Cua for desktop control.
+pip install -e ".[desktop]"
 
 # 3. Pull required Ollama models
 ollama pull qwen3.5:2b
@@ -45,12 +49,28 @@ python -m jarvis  # equivalent
 python -m jarvis --text "How are you doing?"  # one turn without voice hardware
 ```
 
+To run without Cua, create an untracked `config.local.yaml` containing:
+
+```yaml
+extends: config.yaml
+desktop:
+  backend: legacy
+```
+
+The legacy backend can open applications but does not provide Cua's window control.
+The default configuration prompts for approval on mutating actions; see
+[security](docs/security.md) before changing permissions.
+
 The Piper TTS voice model is auto-downloaded to `~/.jarvis/piper_voices/` on first run
 (only when `voice.tts.engine: "piper"`).
 
-**Smaller, faster on a consumer GPU:** [llama.cpp](docs/llamacpp.md) runs the same Qwen model as a
-text-only GGUF that fits a 4 GB card entirely (Ollama's bundled vision encoder pushes it onto the
-CPU) and Jarvis can start and stop `llama-server` for you.
+**Alternative runtime:** [llama.cpp](docs/llamacpp.md) runs GGUF models and can be
+started and stopped by Jarvis. The guide includes measurements from a 4 GB GPU;
+performance and image support depend on the model, projector, and runtime build.
+
+**Bonsai profile:** [Bonsai 2 4B](docs/bonsai-setup.md) uses a project-local Prism
+CUDA runtime and vision projector. To select it on a configured machine, create
+`config.local.yaml` extending `config.bonsai.yaml`.
 
 ### Configuration
 `config.yaml` holds the safe defaults. Put machine-specific changes (audio device,
@@ -59,6 +79,11 @@ wider permissions) in an untracked `config.local.yaml` that starts with
 `--config PATH` or `JARVIS_CONFIG`. See [security profiles](docs/security.md#profiles).
 Compare models or catch regressions with `python -m jarvis.bench` ([scenario benchmark](docs/bench.md)).
 Notable options: `voice.barge_in`, `system.latency_report`, `voice.tts.engine` (`kokoro` or `piper`).
+For an explicit web research request, Jarvis runs a browser search and returns up to three
+search snippets and links; it does not claim to have read the articles. With `voice.barge_in`
+enabled, speech during the search triggers a yes/no cancellation question. A confirmed
+cancellation discards the results; issue a new request after the acknowledgement. Actions
+are processed one at a time, not in parallel.
 `voice.input_device` / `voice.output_device` take an index or a device name such as `"JBL"`;
 a name keeps working when a headset reconnects and indexes shift, and falls back to the system
 default (with a warning) when that device is not connected. `jarvis --doctor` lists the devices.
@@ -66,7 +91,9 @@ default (with a warning) when that device is not connected. `jarvis --doctor` li
 ### Logs
 Console output is one readable line per event, tagged with the turn number
 (`jarvis -v` adds DEBUG detail). The full record, always at DEBUG, is in
-`~/.jarvis/logs/jarvis.log`. See [logging](docs/logging.md) for how to read it.
+`~/.jarvis/logs/jarvis.log`; set `system.log_format: json` for JSON-lines file logs.
+Routine events omit conversation text and tool argument values, but exceptions and
+third-party logs can still contain sensitive data. See [logging](docs/logging.md).
 
 ## Architecture
 
@@ -95,12 +122,12 @@ tests/
 
 ## Development
 
-```bash
-pip install -e .[dev]   # pytest, pytest-asyncio, ruff, coverage
+```powershell
+pip install -e ".[dev]"   # pytest, pytest-asyncio, ruff, coverage
 
 pytest                  # run the unit suite (tests/unit)
 ruff check .            # lint
-coverage run -m pytest && coverage report   # coverage, with the floor CI enforces
+coverage run -m pytest; coverage report   # coverage, including the configured floor
 ```
 
 The unit suite mocks the LLM and needs no microphone, Ollama, or models.
@@ -110,7 +137,10 @@ needs an interactive Windows desktop but no model or voice devices. See
 [how to read the logs](docs/logging.md), the [scenario benchmark](docs/bench.md), the [tool inventory](docs/tools.md)
 (`jarvis --list-tools`), and the [roadmap](docs/roadmap.md).
 
-CI runs pytest + ruff on every push (see `.github/workflows/ci.yml`).
+Run pytest and ruff locally before proposing changes. There is no active CI workflow.
+
+See [architecture and maintenance boundaries](docs/architecture.md) for the request
+paths, module responsibilities, and remaining release gaps.
 
 ### Experimental / unreached capabilities
 `ReActAgent.research()` (autonomous web research) exists but is not wired into the

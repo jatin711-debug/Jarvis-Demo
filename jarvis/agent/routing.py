@@ -162,6 +162,22 @@ def needs_web(text: str) -> bool:
     return bool(_WEB.search(text))
 
 
+def is_web_research(text: str) -> bool:
+    """An explicit request to search for information, not browser navigation."""
+    if not needs_web(text):
+        return False
+    if re.search(r"\b(?:don't|do not|never|without)\s+(?:ever\s+)?"
+                 r"(?:search|research|look up|look into|browse)\b", text, re.I):
+        return False
+    if re.fullmatch(r"\s*(?:can|could|do|would) you\s+(?:search|browse)\s+"
+                    r"(?:the\s+)?(?:web|internet|online)[.!?\s]*", text, re.I):
+        return False
+    if re.search(r"\b(youtube|spotify|netflix|facebook|instagram|linkedin)\b", text, re.I):
+        return False
+    return bool(re.search(r"\b(search|look up|look into|research|find|latest|news|reports)\b",
+                          text, re.I))
+
+
 def needs_vision(text: str) -> bool:
     """True when the request implies looking at the screen."""
     if _VISION.search(text):

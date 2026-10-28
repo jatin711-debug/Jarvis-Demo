@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import contextvars
 import itertools
+import json
 import logging
 import os
 import sys
+import uuid
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _turn_var: contextvars.ContextVar[int | None] = contextvars.ContextVar("jarvis_turn", default=None)
 _turn_counter = itertools.count(1)
+_run_id = uuid.uuid4().hex
 
 
 def begin_turn() -> int:
@@ -63,6 +67,7 @@ _SHORT_NAMES = {
     "jarvis.tools.vision_tools": "vision",
     "jarvis.voice.implementations": "voice",
     "jarvis.voice.engines": "voice",
+    "jarvis.voice.search_monitor": "voice",
     "jarvis.memory.manager": "memory",
     "jarvis.desktop.cua": "desktop",
     "jarvis.tasks.runner": "tasks",
@@ -152,6 +157,25 @@ class FileFormatter(logging.Formatter):
         )
 
 
+class JsonFormatter(logging.Formatter):
+    """One JSON object per event for log collectors; exceptions stay in the event."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event = {
+            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "run_id": _run_id,
+            "turn": getattr(record, "turn", "-"),
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            event["exception"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            event["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(event, ensure_ascii=False)
+
+
 # ──────────────────────────────────────────────
 # Terminal handling
 # ──────────────────────────────────────────────
@@ -191,7 +215,8 @@ def _supports_color(stream) -> bool:
 # Setup
 # ──────────────────────────────────────────────
 
-def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
+def setup_logging(level: str = "INFO", log_dir: str | None = None, *,
+                  file_format: str = "text") -> None:
     """
     Configure the root logger.
 
@@ -199,7 +224,10 @@ def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
         level: Console level (DEBUG, INFO, WARNING, ERROR).
         log_dir: Directory for ``jarvis.log``; the file always records DEBUG.
                  None = console only.
+        file_format: ``text`` or newline-delimited ``json`` for the file.
     """
+    if file_format not in {"text", "json"}:
+        raise ValueError("file_format must be 'text' or 'json'")
     console_level = getattr(logging, level.upper(), logging.INFO)
 
     console = logging.StreamHandler(sys.stderr)
@@ -217,7 +245,7 @@ def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
             log_path / "jarvis.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
         )
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(FileFormatter())
+        file_handler.setFormatter(JsonFormatter() if file_format == "json" else FileFormatter())
         handlers.append(file_handler)
 
     for handler in handlers:

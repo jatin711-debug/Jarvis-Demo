@@ -88,6 +88,7 @@ async def main(argv: list[str] | None = None) -> int:
     setup_logging(
         level="DEBUG" if args.verbose else config.system.log_level,
         log_dir=str(expand_path(config.system.log_dir)),
+        file_format=config.system.log_format,
     )
     logger.info("starting jarvis version=%s config=%s", __version__,
                 resolve_config_path(args.config) or "defaults")

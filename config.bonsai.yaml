@@ -1,0 +1,19 @@
+# Project-local Bonsai 2 4B profile. Run Jarvis from the project root.
+# The GGUF files and Prism CUDA runtime live in git-ignored models/ and runtime/.
+extends: config.llamacpp.yaml
+
+llm:
+  model: ternary-bonsai-2-4b
+  base_url: "http://127.0.0.1:18083"  # dedicated local port avoids a common existing server on 8080
+  enable_thinking: false
+  context_window: 8192
+  temperature: 0.1
+  top_p: 0.9
+  max_tokens: 512
+  server:
+    command: runtime/prism/llama-server.exe
+    model: models/bonsai-4b/Ternary-Bonsai-2-4B-PQ2_0.gguf
+    mmproj: models/bonsai-4b/Ternary-Bonsai-2-4B-mmproj-Q8_0.gguf
+    cache_ram: 0
+    startup_timeout: 180
+    args: ["-ngl", "99", "-fa", "on", "-lm", "none", "--jinja"]

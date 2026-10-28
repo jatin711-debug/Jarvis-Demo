@@ -22,6 +22,7 @@ class SystemConfig(BaseModel):
     name: str = "Jarvis"
     log_level: str = "INFO"
     log_dir: str = "~/.jarvis/logs"
+    log_format: Literal["text", "json"] = "text"
     data_dir: str = "~/.jarvis"
     latency_report: bool = True  # Log per-turn timing breakdown (record/STT/LLM/TTS)
 
@@ -83,6 +84,9 @@ class LLMConfig(BaseModel):
     context_window: int = Field(default=8192, ge=1024)
     request_timeout: float = Field(default=120.0, gt=0)
     first_response_timeout: float = Field(default=30.0, gt=0)
+    # Ollama / llama.cpp: None keeps the Qwen3.5 auto-disable and otherwise leaves
+    # server defaults alone. Set explicitly for renamed/derived models such as Bonsai.
+    enable_thinking: bool | None = None
     max_tool_result_chars: int = Field(default=4000, ge=512)
     max_history_chars: int = Field(default=8000, ge=0)
     server: LlamaServerConfig = Field(default_factory=LlamaServerConfig)  # llamacpp provider only

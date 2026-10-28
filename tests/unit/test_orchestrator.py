@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import jarvis.core.orchestrator as orch
-from jarvis.core.orchestrator import Orchestrator, _clip, _Heard, _split_sentence
+from jarvis.core.orchestrator import Orchestrator, _Heard, _split_sentence
 from jarvis.utils.config import JarvisConfig
 
 
@@ -116,11 +116,6 @@ class TestHelpers:
         assert sentences == ["Hello there.", "How are you?"]
         assert leftover == "Fine."
 
-    def test_clip_collapses_whitespace_and_truncates(self):
-        assert _clip("a\n b   c") == "a b c"
-        assert _clip("x" * 50, limit=10) == "x" * 10 + "..."
-
-
 class TestTextTurn:
     async def test_ask_returns_reply_and_records_history_and_memory(self):
         app = make_app(FakeAgent(reply="Sure thing."))
@@ -139,6 +134,15 @@ class TestTextTurn:
         assert len(app._conversation_history) == 4
         assert app._conversation_history[-2]["content"] == "question 4"
 
+    async def test_zero_history_limit_keeps_no_previous_turns(self):
+        agent = FakeAgent()
+        app = make_app(agent)
+        app.config.memory.max_conversation_turns = 0
+        await app.ask("first question")
+        await app.ask("second question")
+        assert app._conversation_history == []
+        assert agent.calls[-1]["conversation_history"] == []
+
     async def test_ask_before_startup_fails_clearly(self):
         with pytest.raises(RuntimeError, match="startup"):
             await Orchestrator(JarvisConfig()).ask("hello")
@@ -149,8 +153,10 @@ class TestTextTurn:
             await app.ask("open the file list")
         from jarvis.utils.logger import current_turn
         assert current_turn() is None
-        assert any(r.getMessage().startswith("heard text=") for r in caplog.records)
-        assert any(r.getMessage().startswith("reply text=") for r in caplog.records)
+        assert any(r.getMessage().startswith("heard chars=") for r in caplog.records)
+        assert any(r.getMessage().startswith("reply chars=") for r in caplog.records)
+        assert "open the file list" not in caplog.text
+        assert "Done." not in caplog.text
 
 
 class TestStreamingTurn:

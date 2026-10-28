@@ -86,7 +86,7 @@ def parse_element_coords(
             continue
         if nx > 1.0 or ny > 1.0:
             skipped += 1
-            logger.debug("find elements skipped non-normalised line=%r", line)
+            logger.debug("find elements skipped non-normalised coordinates")
             continue
         name = _LIST_MARKER_RE.sub("", line[:match.start()]).strip(" \t:-,;(*`")
         results.append({
@@ -95,7 +95,7 @@ def parse_element_coords(
             "y": min(int(ny * screen_h), max_y),
         })
     if skipped:
-        logger.warning("find elements skipped lines=%d query=%r", skipped, query)
+        logger.warning("find elements skipped lines=%d", skipped)
     return results
 
 
@@ -292,10 +292,10 @@ class VisionClient:
         )
 
         content = await self._ask_vision(prompt, system_hint=system_hint)
-        logger.debug("find elements response=%s", content)
+        logger.debug("find elements response_chars=%d", len(content))
 
         results = parse_element_coords(content, query, screen_w, screen_h)
-        logger.info("found elements count=%d query=%r", len(results), query)
+        logger.info("found elements count=%d", len(results))
         return results
 
     async def analyze_image(self, image_path: str, question: str = "") -> str:

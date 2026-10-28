@@ -114,11 +114,11 @@ class DummyTTS(TTSEngine):
         pass
 
     async def synthesize(self, text: str) -> bytes:
-        logger.info("tts say text=%r", text)
+        logger.info("tts say chars=%d", len(text))
         return b""
 
     async def speak(self, text: str) -> None:
-        logger.info("tts say text=%r", text)
+        logger.info("tts say chars=%d", len(text))
 
 
 class DummyWakeWord(WakeWordEngine):

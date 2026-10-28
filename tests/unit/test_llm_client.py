@@ -145,6 +145,20 @@ class TestRequestBody:
         assert streamed["tools"] == tools
 
 
+@pytest.mark.parametrize("model,enabled", [
+    ("ternary-bonsai-2-4b", False),
+    ("qwen3.5:4b", True),
+    ("other-model", None),
+])
+def test_explicit_thinking_setting_is_forwarded_to_ollama(model, enabled):
+    client = LLMClient(LLMConfig(model=model, enable_thinking=enabled))
+    payload = client._ollama_payload([], None, None, None, None, stream=True)
+    if enabled is None:
+        assert "think" not in payload
+    else:
+        assert payload["think"] is enabled
+
+
 def test_text_only_provider_reports_no_image_support():
     assert LLMClient(LLMConfig(provider="huggingface", model="x")).supports_images is False
     assert LLMClient(LLMConfig()).supports_images is True

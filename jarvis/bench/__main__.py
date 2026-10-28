@@ -95,7 +95,8 @@ async def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     # Only problems on the console, so the table is readable; the log file keeps everything.
-    setup_logging(level="WARNING", log_dir=str(expand_path(config.system.log_dir)))
+    setup_logging(level="WARNING", log_dir=str(expand_path(config.system.log_dir)),
+                  file_format=config.system.log_format)
     config_file = resolve_config_path(args.config)
     print(f"Running {len(scenarios)} scenario(s) x {args.repeat} on "
           f"{config.llm.provider} / {config.llm.model} (config: {config_file or 'defaults'})",

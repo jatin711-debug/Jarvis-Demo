@@ -333,19 +333,30 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             # Wait for results
             await page.wait_for_selector("div#search", timeout=10000)
 
-            # Extract top results
+            # Extract results by their heading link; Google no longer consistently
+            # wraps results in div.g. Return only information visible on the page.
             results = []
-            items = page.locator("div#search div.g")
+            items = page.locator("div#search a:has(h3)")
             count = min(await items.count(), 8)
             for i in range(count):
                 item = items.nth(i)
                 try:
                     title_el = item.locator("h3").first
                     title = await title_el.inner_text() if await title_el.count() > 0 else ""
-                    link_el = item.locator("a").first
-                    href = await link_el.get_attribute("href") if await link_el.count() > 0 else ""
-                    snippet_el = item.locator("div[data-sncf], div.VwiC3b, span.aCOpRe").first
-                    snippet = await snippet_el.inner_text() if await snippet_el.count() > 0 else ""
+                    href = await item.get_attribute("href") or ""
+                    if href.startswith("/"):
+                        from urllib.parse import urljoin
+                        href = urljoin("https://www.google.com", href)
+                    if not href.startswith(("https://", "http://")):
+                        continue
+                    snippet = await item.evaluate("""a => {
+                        let node = a;
+                        for (let i = 0; node && i < 8; i++, node = node.parentElement) {
+                            const text = node.querySelector('div[data-sncf], div.VwiC3b, span.aCOpRe');
+                            if (text && text.innerText) return text.innerText;
+                        }
+                        return '';
+                    }""")
                     if title:
                         results.append(f"{i+1}. {title}\n   {href}\n   {snippet}")
                 except Exception:
@@ -354,6 +365,14 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             if results:
                 return f"Google results for '{query}':\n\n" + "\n\n".join(results)
             return f"Searched for '{query}' but couldn't parse results. Page: {page.url}"
+        except asyncio.CancelledError:
+            # A page navigation may still be in flight after its await is cancelled.
+            if _session.is_running:
+                try:
+                    await _session.page.evaluate("window.stop()")
+                except Exception:
+                    logger.warning("could not stop the cancelled search navigation")
+            raise
         except Exception as e:
             return f"Search failed: {e}"
 

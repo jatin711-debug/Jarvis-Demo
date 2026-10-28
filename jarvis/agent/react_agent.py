@@ -24,7 +24,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,21 +49,23 @@ from jarvis.agent.tool_registry import (
     ToolDefinition,
     ToolRegistry,
 )
+from jarvis.agent.web_research import format_search_results, research_query
 from jarvis.tools.vision_tools import capture_screen_b64
 from jarvis.utils.deadlines import wait_with_progress
 from jarvis.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Maximum tool-calling iterations to prevent infinite loops
+# Maximum tool-calling iterations to prevent infinite loops. Operating an app takes one
+# call per button or field, on top of finding its window, so desktop requests get more.
 MAX_ITERATIONS = 8
+MAX_DESKTOP_ITERATIONS = 16
+# A reply can hold several tool calls, so a model stuck replaying the same clicks is not
+# bounded by the iteration limit alone. 32 covers entering two 9-digit numbers.
+MAX_DESKTOP_TOOL_CALLS = 32
 
 # Retries for transient LLM failures / empty responses
 _MAX_LLM_RETRIES = 2
-
-# Keys whose values must never appear in logs.
-_SECRET_KEY = re.compile(r"pass(word|wd)?|secret|token|api_?key|credential", re.IGNORECASE)
-_LOG_VALUE_CHARS = 60
 
 _SMALL_TALK_PROMPT = (
     "You are Jarvis, a friendly voice assistant. "
@@ -87,18 +89,18 @@ _UNTRUSTED_DATA_NOTE = (
 )
 
 _DESKTOP_NOTE = (
-    "\nUse desktop_windows to discover the exact app window. Use desktop_observe "
-    "before acting. Use only returned pid, window_id, snapshot_id and element_index. "
-    "Never invent identifiers. Each action returns fresh after-state; use its new "
-    "snapshot_id for the next action. Verify the requested outcome from state. "
-    "A truncated tree is incomplete, not proof a control is absent. "
-    "Do not repeat a refused or uncertain action blindly."
-    " desktop_windows() takes NO arguments. desktop_observe(pid, window_id) "
-    "takes ONLY these two arguments and returns snapshot_id and element_index. "
-    "Never ask the user for internal IDs: discover them with these read-only tools. "
-    "An unknown-parameter error means REMOVE that argument, not ask the user for it."
+    "\nDesktop apps: desktop_launch opens an app and lists its windows; desktop_windows "
+    "lists them again. desktop_observe(pid, window_id) lists a window's controls as "
+    '`index Role "label"`. Use only pid and window_id values that were listed; never ask '
+    "the user for IDs. Act with desktop_click, desktop_type or desktop_key by the control's "
+    "label exactly as listed (index only when two controls share a label). Each action "
+    "returns what changed: report what the window actually shows, not what you expect or "
+    "your own calculation. If a window is minimized or the app refuses, tell the user "
+    "instead of retrying. desktop_windows() takes NO arguments; an unknown-parameter "
+    "error means REMOVE that argument."
 )
-_DESKTOP_ERROR_HINT = " For desktop IDs, call desktop_windows() then desktop_observe(pid, window_id)."
+_DESKTOP_ERROR_HINT = (" pid and window_id come from desktop_windows(); control labels come from "
+                       "desktop_observe(pid, window_id).")
 
 _NATIVE_CLAIM_NUDGE = (
     "You said you did something but you did NOT call any tool. "
@@ -115,25 +117,9 @@ _REPEAT_NOTE = (
     "Do NOT repeat it. Either use a DIFFERENT tool, or give your "
     "final text response now."
 )
-
-
-def _brief(text: str, limit: int = 120) -> str:
-    text = " ".join(text.split())
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def _brief_args(args: dict[str, Any]) -> str:
-    """Compact, secret-free rendering of tool arguments for logs."""
-    parts = []
-    for key, value in args.items():
-        if _SECRET_KEY.search(key):
-            shown = "<redacted>"
-        else:
-            shown = " ".join(repr(value).split())
-            if len(shown) > _LOG_VALUE_CHARS:
-                shown = shown[:_LOG_VALUE_CHARS] + "..."
-        parts.append(f"{key}={shown}")
-    return ", ".join(parts)
+_UNSUPPORTED_PROGRESS = re.compile(
+    r"\b(?:i(?:'m| am)\s+(?:still\s+)?(?:searching|researching|looking\s+(?:for|up|into))|"
+    r"(?:the\s+)?search\s+is\s+(?:still\s+)?(?:running|in progress))\b", re.I)
 
 
 @dataclass
@@ -157,8 +143,10 @@ class _Turn:
     tools: list[ToolDefinition]
     seen_calls: set[tuple[str, str]] = field(default_factory=set)
     tool_was_called: bool = False
+    tool_calls_made: int = 0
     claim_retries: int = 0
     empty_retries: int = 0
+    search_result: str | None = None
 
 
 class ReActAgent:
@@ -183,6 +171,9 @@ class ReActAgent:
         self._desktop_active = False
         self._last_route: Route | None = None  # lets "now read it back" keep the last request's tools
         self._base_system_prompt = system_prompt
+        # The voice loop may monitor a search while it is running. Text turns
+        # leave this unset and execute the same tool normally.
+        self.search_monitor: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None
         # None = native tool support unknown (optimistic), False = disabled
         self._native_tools_ok: bool | None = (llm.provider in ("ollama", "llamacpp")) or None
 
@@ -334,7 +325,7 @@ class ReActAgent:
                 yield event
 
     async def _call_model(self, turn: _Turn, reply: _ModelReply, *, first_iteration: bool,
-                          stream: bool) -> AsyncIterator[str]:
+                          stream: bool, hold_text: bool = False) -> AsyncIterator[str]:
         """
         One model call. Fills ``reply``; when streaming, also yields the text
         that is safe to speak (tool-call markup is held back).
@@ -359,13 +350,13 @@ class ReActAgent:
                     done_event = event
                     break
                 safe = guard.feed(event["text"])
-                if safe:
+                if safe and not hold_text:
                     yield safe
         if done_event is not None:
             reply.tool_calls = done_event.get("tool_calls", [])
         reply.content = guard.text
         # Held-back text that isn't a tool call is innocent - flush it.
-        if guard.held and not reply.tool_calls and not parse_tool_call(reply.content):
+        if not hold_text and guard.held and not reply.tool_calls and not parse_tool_call(reply.content):
             yield guard.held
 
     # ── The ReAct loop ──────────────────────────────────────
@@ -378,6 +369,7 @@ class ReActAgent:
         stream: bool,
     ) -> AsyncIterator[str]:
         """Route the request, then run either the fast path or the ReAct loop."""
+        query = research_query(user_message, conversation_history)
         route = route_request(
             user_message,
             system_tools=set(self.tools.list_tools()),
@@ -386,6 +378,8 @@ class ReActAgent:
             desktop_active=self._desktop_active,
             previous=self._last_route,
         )
+        if query and self._browser_tools and self._browser_tools.get("browser_search"):
+            route = Route(Surface.BROWSER)
         self._desktop_active = route.surface is Surface.DESKTOP
         self._last_route = route
         logger.info("route %s", route.describe())
@@ -397,6 +391,20 @@ class ReActAgent:
             return
 
         turn = await self._prepare_turn(user_message, conversation_history, context, route)
+        if query and route.surface is Surface.BROWSER and "browser_search" in turn.offered:
+            # The user requested research: execute the search rather than relying
+            # on the model to volunteer a tool call or invent the results.
+            if stream:
+                yield "I'll search the web. "
+            call = {"function": {"name": "browser_search", "arguments": {"query": query}}}
+            reply = _ModelReply(tool_calls=[call])
+            final = await self._run_tool_calls(turn, reply, [{"tool": "browser_search",
+                                                            "args": {"query": query}}], True)
+            if final is not None:
+                yield final
+                return
+            yield format_search_results(turn.search_result)
+            return
         async with aclosing(self._react_loop(turn, stream)) as tokens:
             async for token in tokens:
                 yield token
@@ -464,14 +472,16 @@ class ReActAgent:
 
     async def _react_loop(self, turn: _Turn, stream: bool) -> AsyncIterator[str]:
         last_content = ""
+        max_iterations = MAX_DESKTOP_ITERATIONS if turn.route.surface is Surface.DESKTOP else MAX_ITERATIONS
 
-        for iteration in range(MAX_ITERATIONS):
-            logger.debug("iteration %d/%d tools_offered=%d", iteration + 1, MAX_ITERATIONS,
+        for iteration in range(max_iterations):
+            logger.debug("iteration %d/%d tools_offered=%d", iteration + 1, max_iterations,
                          len(turn.native_tools or turn.tools))
             reply = _ModelReply()
+            hold_text = stream and turn.route.surface is Surface.CHAT and not turn.tool_was_called
             try:
                 async with aclosing(self._call_model(turn, reply, first_iteration=iteration == 0,
-                                                     stream=stream)) as tokens:
+                                                     stream=stream, hold_text=hold_text)) as tokens:
                     async for token in tokens:
                         yield token
             except (TimeoutError, httpx.TimeoutException):
@@ -486,6 +496,11 @@ class ReActAgent:
                     turn.messages[0]["content"] = self._build_system_prompt(
                         turn.context, tools=turn.tools, use_native=False, surface=turn.route.surface)
                     continue
+                if self._context_exceeded(e):
+                    logger.warning("conversation no longer fits the model's context; ending turn")
+                    yield ("That got too long for me to keep track of, so I stopped. "
+                           "Please check where things stand.")
+                    return
                 raise
 
             last_content = reply.content
@@ -504,12 +519,15 @@ class ReActAgent:
             calls, native_call = self._resolve_calls(reply)
 
             if not calls:
+                if not turn.tool_was_called and not turn.offered and _UNSUPPORTED_PROGRESS.search(reply.content):
+                    yield "I haven't started a search. Please tell me what you would like me to search for."
+                    return
                 nudge = self._claim_nudge(turn, reply.content)
                 if nudge is not None:
                     turn.messages.append({"role": "assistant", "content": reply.content})
                     turn.messages.append({"role": "user", "content": nudge})
                     continue
-                if not stream:
+                if not stream or hold_text:
                     yield strip_thinking(reply.content) or reply.content
                 return
 
@@ -519,7 +537,7 @@ class ReActAgent:
                 return
 
         logger.warning("iteration limit reached limit=%d tools_called=%s",
-                       MAX_ITERATIONS, turn.tool_was_called)
+                       max_iterations, turn.tool_was_called)
         if turn.tool_was_called:
             yield "I reached the step limit before verifying completion."
         else:
@@ -533,6 +551,15 @@ class ReActAgent:
         except Exception:
             body = ""
         return error.response.status_code == 400 and "tool" in body.lower()
+
+    @staticmethod
+    def _context_exceeded(error: httpx.HTTPStatusError) -> bool:
+        """True when the server refused the request for being longer than its context."""
+        try:
+            body = error.response.text[:300]
+        except Exception:
+            body = ""
+        return error.response.status_code == 400 and "context size" in body.lower()
 
     def _resolve_calls(self, reply: _ModelReply) -> tuple[list[dict[str, Any]], bool]:
         """Tool calls from the reply: native first, text parsing second."""
@@ -579,17 +606,30 @@ class ReActAgent:
                 turn.messages.append({"role": "tool", "name": name, "content": note} if native_call
                                      else {"role": "user", "content": note})
                 continue
+            if turn.route.surface is Surface.DESKTOP and turn.tool_calls_made >= MAX_DESKTOP_TOOL_CALLS:
+                logger.warning("desktop action limit reached limit=%d; ending turn",
+                               MAX_DESKTOP_TOOL_CALLS)
+                return (f"I stopped after {turn.tool_calls_made} actions without finishing. "
+                        "Please check the app to see where things stand.")
             turn.seen_calls.add(key)
             turn.tool_was_called = True
+            turn.tool_calls_made += 1
 
             result = await self._invoke_tool(turn, name, args, definition)
 
             if result == CANCELLED_MESSAGE:
                 logger.info("tool declined by user name=%s; ending turn", name)
+                if name == "browser_search":
+                    return "Okay, I won't use those search results. What would you like to do instead?"
                 return "Okay, I cancelled that action."
             if result.startswith(PERMISSION_DENIED_PREFIX):
                 logger.info("tool refused by policy name=%s; ending turn", name)
                 return result
+            if name == "browser_search" and (result.startswith("Search failed:")
+                                               or "couldn't parse results" in result):
+                return "I couldn't retrieve search results. Please try again."
+            if name == "browser_search":
+                turn.search_result = result
 
             limit = getattr(getattr(self.llm, "config", None), "max_tool_result_chars", 4000)
             if len(result) > limit:
@@ -611,7 +651,7 @@ class ReActAgent:
     async def _invoke_tool(self, turn: _Turn, name: str, args: dict[str, Any],
                            definition: ToolDefinition | None) -> str:
         """Run one tool; failures come back as text for the model rather than raising."""
-        logger.info("tool call name=%s args={%s}", name, _brief_args(args))
+        logger.info("tool call name=%s args_count=%d", name, len(args))
         started = time.monotonic()
         try:
             if definition is not None and name not in turn.offered:
@@ -619,7 +659,11 @@ class ReActAgent:
             if turn.route.surface is Surface.DESKTOP and not (
                     self._desktop_tools and self._desktop_tools.get(name)):
                 raise ValueError("Tool is not available in desktop mode")
-            result = str(await self._execute_tool(name, **args))
+            operation = self._execute_tool(name, **args)
+            if name == "browser_search" and self.search_monitor is not None:
+                result = str(await self.search_monitor(operation))
+            else:
+                result = str(await operation)
             outcome = "ok"
         except ValueError as exc:
             hint = _DESKTOP_ERROR_HINT if turn.route.surface is Surface.DESKTOP else ""
@@ -631,8 +675,7 @@ class ReActAgent:
 
         elapsed_ms = (time.monotonic() - started) * 1000
         logger.log(logging.INFO if outcome == "ok" else logging.WARNING,
-                   "tool %s name=%s ms=%.0f chars=%d%s", outcome, name, elapsed_ms, len(result),
-                   "" if outcome == "ok" else f" detail={_brief(result)}")
+                   "tool %s name=%s ms=%.0f chars=%d", outcome, name, elapsed_ms, len(result))
         return result
 
     # ── Public API ──────────────────────────────────────────
